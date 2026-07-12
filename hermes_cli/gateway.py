@@ -2656,6 +2656,19 @@ def _build_service_path_dirs(project_root: Path | None = None) -> list[str]:
     return candidates
 
 
+def _deduplicate_service_path_dirs(entries: list[str]) -> list[str]:
+    """Preserve PATH order while collapsing equivalent trailing-slash forms."""
+    deduplicated: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        key = entry.rstrip("/") or "/"
+        if key in seen:
+            continue
+        seen.add(key)
+        deduplicated.append(entry)
+    return deduplicated
+
+
 def _stable_service_working_dir() -> str:
     """Return a WorkingDirectory that will not disappear out from under systemd.
 
@@ -2739,7 +2752,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         path_entries.extend(_build_user_local_paths(Path(home_dir), path_entries))
         path_entries.extend(_build_wsl_interop_paths(path_entries))
         path_entries.extend(common_bin_paths)
-        sane_path = ":".join(path_entries)
+        sane_path = ":".join(_deduplicate_service_path_dirs(path_entries))
         return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
@@ -2778,7 +2791,7 @@ WantedBy=multi-user.target
     path_entries.extend(_build_user_local_paths(Path.home(), path_entries))
     path_entries.extend(_build_wsl_interop_paths(path_entries))
     path_entries.extend(common_bin_paths)
-    sane_path = ":".join(path_entries)
+    sane_path = ":".join(_deduplicate_service_path_dirs(path_entries))
     return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
