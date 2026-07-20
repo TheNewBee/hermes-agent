@@ -25,6 +25,26 @@ from typing import Dict, List, Optional, Set, Any
 logger = logging.getLogger(__name__)
 
 
+def _strip_cron_wrapper_for_clean_delivery(
+    content: str, metadata: Optional[Dict[str, Any]] = None
+) -> str:
+    """Strip the scheduler wrapper only for an explicitly opted-in delivery."""
+    if not (metadata or {}).get("strip_cron_wrapper"):
+        return content
+    if not content.startswith("Cronjob Response: "):
+        return content
+
+    divider = "\n-------------\n\n"
+    footer_prefix = '\n\nTo stop or manage this job, send me a new message (e.g. "stop reminder '
+    divider_pos = content.find(divider)
+    footer_pos = content.rfind(footer_prefix)
+    if divider_pos < 0 or footer_pos < 0 or footer_pos <= divider_pos:
+        return content
+
+    body_start = divider_pos + len(divider)
+    return content[body_start:footer_pos].strip()
+
+
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
@@ -4017,7 +4037,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
+        content = _strip_cron_wrapper_for_clean_delivery(content, metadata)
+
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls
