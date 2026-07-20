@@ -66,6 +66,35 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def test_run_one_job_finalizes_persisted_terminal_artifact_after_delivery(monkeypatch):
+    calls = _patch_pipeline(monkeypatch)
+    finalized = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        calls.append(("run_job", job["id"]))
+        s._cron_run_session_id.set("cron_j2_20260720_090000")
+        return True, "out", "final response", None
+
+    def fake_finalize(**kwargs):
+        calls.append(("finalize", kwargs["session_id"]))
+        finalized.append(kwargs)
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "_invoke_cron_output_finalized", fake_finalize)
+
+    assert s.run_one_job({"id": "j2", "name": "t"}) is True
+    assert [call[0] for call in calls] == [
+        "run_job", "save", "deliver", "finalize", "mark"
+    ]
+    assert finalized == [{
+        "response_text": "final response",
+        "session_id": "cron_j2_20260720_090000",
+        "model": "",
+        "artifact_path": "/tmp/j2.txt",
+        "delivery_state": "DELIVERY_ATTEMPTED",
+    }]
+
+
 def test_run_one_job_silent_skips_delivery(monkeypatch):
     """A [SILENT] final response saves output + marks the run but does NOT
     deliver."""

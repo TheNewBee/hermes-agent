@@ -141,6 +141,9 @@ VALID_HOOKS: Set[str] = {
     # Plugins return a string to replace the response text, or None/empty to leave unchanged.
     # First non-None string wins. Useful for vocabulary/personality transformation.
     "transform_llm_output",
+    # Observes the persisted terminal response after a cron run has completed
+    # its delivery attempt. Return values are ignored.
+    "cron_output_finalized",
     "pre_llm_call",
     "post_llm_call",
     # Verification-loop gate. Fired once per turn when the agent has edited code
