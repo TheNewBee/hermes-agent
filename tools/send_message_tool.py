@@ -780,7 +780,16 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(
+    platform,
+    pconfig,
+    chat_id,
+    message,
+    thread_id=None,
+    media_files=None,
+    force_document=False,
+    metadata=None,
+):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -852,6 +861,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # after all text chunks.
     if platform == Platform.TELEGRAM:
         disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
+        telegram_metadata = dict(metadata or {})
+        if thread_id is not None and "thread_id" not in telegram_metadata:
+            telegram_metadata["thread_id"] = thread_id
         return await _send_telegram(
             pconfig.token,
             chat_id,
@@ -860,6 +872,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            metadata=telegram_metadata or None,
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -1173,7 +1186,16 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(
+    token,
+    chat_id,
+    message,
+    media_files=None,
+    thread_id=None,
+    disable_link_previews=False,
+    force_document=False,
+    metadata=None,
+):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1184,6 +1206,10 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
     try:
         from telegram import Bot
         from telegram.constants import ParseMode
+
+        from plugins.platforms.telegram.adapter import _strip_cron_wrapper_for_clean_delivery
+
+        message = _strip_cron_wrapper_for_clean_delivery(message, metadata)
 
         # Auto-detect HTML tags — if present, skip MarkdownV2 and send as HTML.
         # Inspired by github.com/ashaney — PR #1568.

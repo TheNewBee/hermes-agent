@@ -137,6 +137,57 @@ def _make_adapter():
     return adapter
 
 
+@pytest.mark.asyncio
+async def test_send_strips_cron_wrapper_when_metadata_requests_clean_delivery():
+    adapter = _make_adapter()
+    mock_send_message = AsyncMock(return_value=SimpleNamespace(message_id=321))
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+    adapter.send_typing = AsyncMock()
+    adapter._should_attempt_rich = lambda content, metadata=None: False
+
+    result = await adapter.send(
+        chat_id="-100123",
+        content=(
+            "Cronjob Response: stock-alpha (job_id: stock-job)\n-------------\n\n"
+            "Stock Alpha — 2026-07-15\nTop picks\n\n"
+            "To stop or manage this job, send me a new message (e.g. \"stop reminder abc123\")"
+        ),
+        metadata={"strip_cron_wrapper": True},
+    )
+
+    assert result.success is True
+    mock_send_message.assert_awaited_once()
+    sent_text = mock_send_message.await_args.kwargs["text"]
+    assert "Stock Alpha" in sent_text
+    assert "Top picks" in sent_text
+    assert "Cronjob Response" not in sent_text
+    assert "To stop or manage this job" not in sent_text
+
+
+@pytest.mark.asyncio
+async def test_send_keeps_cron_wrapper_without_opt_in_metadata():
+    adapter = _make_adapter()
+    mock_send_message = AsyncMock(return_value=SimpleNamespace(message_id=322))
+    adapter._bot = SimpleNamespace(send_message=mock_send_message)
+    adapter.send_typing = AsyncMock()
+    adapter._should_attempt_rich = lambda content, metadata=None: False
+
+    result = await adapter.send(
+        chat_id="-100124",
+        content=(
+            "Cronjob Response: other-job (job_id: other-job)\n-------------\n\n"
+            "Keep this wrapped\n\n"
+            "To stop or manage this job, send me a new message (e.g. \"stop reminder abc123\")"
+        ),
+        metadata={"job_id": "other-job"},
+    )
+
+    assert result.success is True
+    sent_text = mock_send_message.await_args.kwargs["text"]
+    assert "Cronjob Response" in sent_text
+    assert "To stop or manage this job" in sent_text
+
+
 def test_non_forum_group_reply_thread_id_does_not_fork_session_key():
     """Reply-derived thread ids in ordinary groups must not create topic lanes."""
     import plugins.platforms.telegram.adapter as telegram_mod

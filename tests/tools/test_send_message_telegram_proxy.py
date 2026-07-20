@@ -155,3 +155,54 @@ class TestSendTelegramStandaloneProxy:
         assert "get_updates_request" not in call_kwargs
         httpx_request_factory.assert_not_called()
         bot.send_message.assert_awaited_once()
+
+    def test_wrapper_strip_metadata_reaches_standalone_telegram_boundary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The standalone platform router forwards opt-in metadata to Telegram."""
+        from gateway.config import Platform
+        from tools.send_message_tool import _send_to_platform
+
+        for var in (
+            "TELEGRAM_PROXY",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: None)
+        monkeypatch.setattr(sys, "platform", "linux")
+
+        bot = _make_bot()
+        bot_factory = MagicMock(return_value=bot)
+        httpx_request_factory = MagicMock(side_effect=lambda **kw: MagicMock(_kw=kw))
+        _install_telegram_mock_with_request(monkeypatch, bot_factory, httpx_request_factory)
+
+        wrapped = (
+            "Cronjob Response: stock-alpha (job_id: stock-job)\n-------------\n\n"
+            "Stock Alpha — 2026-07-15\nTop picks\n\n"
+            "To stop or manage this job, send me a new message (e.g. \"stop reminder abc123\")"
+        )
+        pconfig = SimpleNamespace(token="tok", extra={})
+        result: dict[str, Any] = asyncio.run(
+            _send_to_platform(
+                Platform.TELEGRAM,
+                pconfig,
+                "123",
+                wrapped,
+                metadata={"strip_cron_wrapper": True},
+            )
+        )
+
+        assert result["success"] is True
+        bot.send_message.assert_awaited_once()
+        sent_text = bot.send_message.await_args.kwargs["text"]
+        assert "Stock Alpha" in sent_text
+        assert "Top picks" in sent_text
+        assert "Cronjob Response" not in sent_text
+        assert "To stop or manage this job" not in sent_text

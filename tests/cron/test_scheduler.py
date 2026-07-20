@@ -284,7 +284,36 @@ class TestDeliverResultWrapping:
         assert "-------------" in sent_content
         assert "Here is today's summary." in sent_content
         assert "To stop or manage this job" in sent_content
+        assert send_mock.call_args.kwargs["metadata"] == {"job_id": "test-job"}
 
+
+    def test_delivery_marks_opted_in_telegram_job_for_wrapper_stripping(self):
+        """Only an opted-in Telegram job adds the boundary cleanup metadata."""
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "stock-job",
+                "name": "stock-alpha",
+                "deliver": "origin",
+                "origin": {"platform": "telegram", "chat_id": "123"},
+                "telegram_strip_cron_wrapper": True,
+            }
+            _deliver_result(job, "Research header\nBody")
+
+        send_mock.assert_called_once()
+        sent_content = send_mock.call_args.kwargs.get("content") or send_mock.call_args[0][3]
+        assert "Cronjob Response: stock-alpha" in sent_content
+        assert send_mock.call_args.kwargs["metadata"] == {
+            "job_id": "stock-job",
+            "strip_cron_wrapper": True,
+        }
 
     def test_relay_fronted_home_uses_relay_config_and_live_adapter(self, monkeypatch, tmp_path):
         """Persisted Slack home survives restart without native Slack config."""
