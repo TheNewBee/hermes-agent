@@ -338,6 +338,15 @@ _parallel_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_lock = threading.Lock()
+# ``run_job`` owns creation of the cron session and learns the final resolved
+# model. ``run_one_job`` owns persistence/delivery, so use context-local state
+# to carry only this terminal-artifact metadata across that boundary.
+_cron_run_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "cron_run_session_id", default=""
+)
+_cron_run_model: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "cron_run_model", default=""
+)
 
 # Job IDs the gateway shutdown path force-killed the tool subprocess of
 # while still in ``_running_job_ids`` (see ``mark_running_jobs_interrupted``
@@ -1717,6 +1726,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
+            if platform == Platform.TELEGRAM and job.get("telegram_strip_cron_wrapper"):
+                route_metadata["strip_cron_wrapper"] = True
+
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
                 # Route through the gateway's DeliveryRouter so the live send
@@ -1940,7 +1952,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 delivery_errors.extend(target_errors)
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            standalone_metadata = {"job_id": job["id"]}
+            if platform == Platform.TELEGRAM and job.get("telegram_strip_cron_wrapper"):
+                standalone_metadata["strip_cron_wrapper"] = True
+            coro = _send_to_platform(
+                platform,
+                pconfig,
+                chat_id,
+                cleaned_delivery_content,
+                thread_id=thread_id,
+                media_files=media_files,
+                metadata=standalone_metadata,
+            )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
@@ -1969,7 +1992,18 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                        future = pool.submit(
+                            asyncio.run,
+                            _send_to_platform(
+                                platform,
+                                pconfig,
+                                chat_id,
+                                cleaned_delivery_content,
+                                thread_id=thread_id,
+                                media_files=media_files,
+                                metadata=standalone_metadata,
+                            ),
+                        )
                         result = future.result(timeout=30)
                     finally:
                         pool.shutdown(wait=False)
@@ -2011,6 +2045,31 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     if delivery_errors:
         return "; ".join(delivery_errors)
     return None
+
+
+def _invoke_cron_output_finalized(
+    *,
+    response_text: str,
+    session_id: str,
+    model: str,
+    artifact_path: str,
+    delivery_state: str,
+) -> None:
+    """Notify observers only after cron has persisted its terminal artifact."""
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook(
+            "cron_output_finalized",
+            response_text=response_text,
+            session_id=session_id,
+            model=model,
+            platform="cron",
+            artifact_path=artifact_path,
+            delivery_state=delivery_state,
+        )
+    except Exception as exc:
+        logger.warning("cron_output_finalized hook failed: %s", exc)
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
@@ -2908,6 +2967,7 @@ def run_job(
         return True, "", SILENT_MARKER, None
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    _cron_run_session_id.set(_cron_session_id)
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -3539,6 +3599,7 @@ def run_job(
             )
 
         final_response = result.get("final_response", "") or ""
+        _cron_run_model.set(str(result.get("model") or getattr(agent, "model", "") or ""))
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
@@ -3726,6 +3787,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    session_token = _cron_run_session_id.set("")
+    model_token = _cron_run_model.set("")
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -3854,6 +3917,26 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
+        session_id = _cron_run_session_id.get()
+        if success and session_id:
+            if should_deliver:
+                # ``_deliver_result`` returns None for both successful remote
+                # sends and intentional local-only routing. The durable fact at
+                # this seam is a completed attempt after persistence; do not
+                # overclaim a remote delivery receipt.
+                delivery_state = (
+                    "DELIVERY_ATTEMPTED" if delivery_error is None else "DELIVERY_FAILED"
+                )
+            else:
+                delivery_state = "PERSISTED_ONLY"
+            _invoke_cron_output_finalized(
+                response_text=final_response,
+                session_id=session_id,
+                model=_cron_run_model.get(),
+                artifact_path=str(output_file),
+                delivery_state=delivery_state,
+            )
+
         if not _consume_interrupted_flag(job["id"]):
             mark_job_run(job["id"], success, error, delivery_error=delivery_error)
         finish_execution(execution_id, success=success, error=error)
@@ -3865,6 +3948,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             mark_job_run(job["id"], False, str(e))
         finish_execution(execution_id, success=False, error=str(e))
         return False
+    finally:
+        _cron_run_model.reset(model_token)
+        _cron_run_session_id.reset(session_token)
 
 
 def _notify_provider_jobs_changed() -> None:
