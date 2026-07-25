@@ -1858,6 +1858,17 @@ class TestMultiTargetDeliveryContinuesOnFailure:
         mock_cfg.platforms = {Platform.EMAIL: pconfig}
         return mock_cfg
 
+    @staticmethod
+    def _submit_futures_after_closing_coroutine(*futures):
+        """Model executor ownership when its mocked worker never runs a coro."""
+        pending_futures = iter(futures)
+
+        def submit(_runner, coroutine):
+            coroutine.close()
+            return next(pending_futures)
+
+        return submit
+
     def test_first_target_failure_does_not_crash_loop(self):
         """First email target fails in the fallback; the second is still attempted."""
         job = {
@@ -1876,7 +1887,9 @@ class TestMultiTargetDeliveryContinuesOnFailure:
             fail_future.result.side_effect = ConnectionError("SMTP connection refused")
             ok_future = MagicMock()
             ok_future.result.return_value = {"success": True}
-            mock_pool.submit.side_effect = [fail_future, ok_future]
+            mock_pool.submit.side_effect = self._submit_futures_after_closing_coroutine(
+                fail_future, ok_future
+            )
 
             result = _deliver_result(job, "Report content")
 
@@ -1905,7 +1918,9 @@ class TestMultiTargetDeliveryContinuesOnFailure:
 
             fail_future = MagicMock()
             fail_future.result.side_effect = ConnectionError("connection refused")
-            mock_pool.submit.return_value = fail_future
+            mock_pool.submit.side_effect = self._submit_futures_after_closing_coroutine(
+                fail_future, fail_future
+            )
 
             result = _deliver_result(job, "Report content")
 

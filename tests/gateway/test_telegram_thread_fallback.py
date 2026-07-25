@@ -8,6 +8,7 @@ user message. If either anchor is unavailable or rejected, the adapter must
 avoid retrying with a partial topic route that can render outside the lane.
 """
 
+import importlib
 import sys
 import socket
 import types
@@ -32,7 +33,11 @@ from gateway.session import build_session_key
 #   BadRequest → NetworkError → TelegramError → Exception
 
 
-class FakeNetworkError(Exception):
+class FakeTelegramError(Exception):
+    pass
+
+
+class FakeNetworkError(FakeTelegramError):
     pass
 
 
@@ -44,7 +49,7 @@ class FakeTimedOut(FakeNetworkError):
     pass
 
 
-class FakeRetryAfter(Exception):
+class FakeRetryAfter(FakeTelegramError):
     def __init__(self, seconds):
         super().__init__(f"Retry after {seconds}")
         self.retry_after = seconds
@@ -74,10 +79,13 @@ _fake_telegram = types.ModuleType("telegram")
 _fake_telegram.Update = object
 _fake_telegram.Bot = object
 _fake_telegram.Message = object
+setattr(_fake_telegram, "MessageEntity", object)
 _fake_telegram.InlineKeyboardButton = _FakeInlineKeyboardButton
 _fake_telegram.InlineKeyboardMarkup = _FakeInlineKeyboardMarkup
 _fake_telegram.InputMediaPhoto = _FakeInputMediaPhoto
+setattr(_fake_telegram, "LinkPreviewOptions", object)
 _fake_telegram_error = types.ModuleType("telegram.error")
+setattr(_fake_telegram_error, "TelegramError", FakeTelegramError)
 _fake_telegram_error.NetworkError = FakeNetworkError
 _fake_telegram_error.BadRequest = FakeBadRequest
 _fake_telegram_error.TimedOut = FakeTimedOut
@@ -105,16 +113,44 @@ _fake_telegram_ext.ContextTypes = SimpleNamespace(DEFAULT_TYPE=object)
 _fake_telegram_ext.filters = object
 _fake_telegram_request = types.ModuleType("telegram.request")
 _fake_telegram_request.HTTPXRequest = object
+_ADAPTER_MODULE = "plugins.platforms.telegram.adapter"
+_ADAPTER_PARENT_MODULE = "plugins.platforms.telegram"
+_MISSING = object()
 
 
 @pytest.fixture(autouse=True)
 def _inject_fake_telegram(monkeypatch):
-    """Inject fake telegram modules so the adapter can import from them."""
+    """Load the adapter against complete fakes without leaking import state."""
+    parent = sys.modules.get(_ADAPTER_PARENT_MODULE)
+    previous_parent_adapter = getattr(parent, "adapter", _MISSING)
+    previous_adapter = sys.modules.pop(_ADAPTER_MODULE, None)
     monkeypatch.setitem(sys.modules, "telegram", _fake_telegram)
     monkeypatch.setitem(sys.modules, "telegram.error", _fake_telegram_error)
     monkeypatch.setitem(sys.modules, "telegram.constants", _fake_telegram_constants)
     monkeypatch.setitem(sys.modules, "telegram.ext", _fake_telegram_ext)
     monkeypatch.setitem(sys.modules, "telegram.request", _fake_telegram_request)
+    importlib.import_module(_ADAPTER_MODULE)
+    yield
+
+    sys.modules.pop(_ADAPTER_MODULE, None)
+    if previous_adapter is not None:
+        sys.modules[_ADAPTER_MODULE] = previous_adapter
+    if parent is not None:
+        if previous_parent_adapter is _MISSING:
+            delattr(parent, "adapter")
+        else:
+            setattr(parent, "adapter", previous_parent_adapter)
+
+
+def test_scheduler_then_proxy_import_order_uses_fake_chat_types():
+    """The thread fixture must override adapter state cached by other suites."""
+    from cron import scheduler
+    from tools import send_message_tool
+    import plugins.platforms.telegram.adapter as telegram_mod
+
+    assert scheduler is not None
+    assert send_message_tool is not None
+    assert telegram_mod.ChatType is _fake_telegram_constants.ChatType
 
 
 def _make_adapter():
