@@ -5497,6 +5497,7 @@ def run_job(
             exit_non_dispatcher_owned_context(_non_dispatcher_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
+        _final_cron_session_id = _cron_session_id
         if _session_db:
             # The agent turn has already returned. Bound every subsequent DB
             # operation so storage failure cannot hold the dispatch guard.
@@ -5506,7 +5507,6 @@ def run_job(
             # cron id captured before AIAgent started. SessionDB is the source
             # of truth for the lineage; agent.session_id is only a fail-safe
             # when the lookup itself is unavailable.
-            _final_cron_session_id = _cron_session_id
             try:
                 _compression_tip = _session_db.get_compression_tip(
                     _cron_session_id
@@ -5570,6 +5570,11 @@ def run_job(
                 _session_db.close()
             except (Exception, KeyboardInterrupt) as e:
                 logger.debug("Job '%s': failed to close SQLite session store: %s", job_id, e)
+        # The scheduler persists and delivers after run_job returns. Preserve
+        # only this ephemeral correlation key on the in-memory job so a
+        # terminal observer receives the session transform_llm_output audited,
+        # including a compression continuation when one was created.
+        job["_hermes_final_cron_session_id"] = _final_cron_session_id
         # Release subprocesses, terminal sandboxes, browser daemons, and the
         # main OpenAI/httpx client held by this ephemeral cron agent. Without
         # this, a gateway that ticks cron every N minutes leaks fds per job
@@ -5720,6 +5725,28 @@ def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
         stop.set()
         heartbeat_thread.join(timeout=1.0)
 
+def _finalize_persisted_cron_output(job: dict, output: str, output_file: Path | str) -> None:
+    """Notify observer plugins after durable cron-output persistence.
+
+    This post-save, best-effort hook receives the exact artifact text and path
+    but cannot influence delivery, scheduler status, or provider behavior.
+    """
+    session_id = str(job.get("_hermes_final_cron_session_id") or "")
+    if not session_id:
+        return
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook(
+            "cron_output_finalized",
+            response_text=output,
+            session_id=session_id,
+            platform="cron",
+            artifact_path=str(output_file),
+            delivery_state="PERSISTED_ONLY",
+        )
+    except Exception as exc:
+        logger.warning("cron_output_finalized hook dispatch failed: %s", exc)
 
 def run_one_job(
     job: dict,
@@ -5949,6 +5976,8 @@ def _run_one_job_body(
                 output_file = save_job_output(job["id"], output)
             if verbose:
                 logger.info("Output saved to: %s", output_file)
+
+            _finalize_persisted_cron_output(job, output, output_file)
 
             # If the gateway shutdown killed this job's tool subprocess
             # mid-flight (#60432), the agent may still have produced a

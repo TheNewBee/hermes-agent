@@ -162,6 +162,10 @@ VALID_HOOKS: Set[str] = {
     # Plugins return a string to replace the response text, or None/empty to leave unchanged.
     # First non-None string wins. Useful for vocabulary/personality transformation.
     "transform_llm_output",
+    # Observer-only terminal cron-artifact hook. Fired after the scheduler
+    # atomically persists output and before any delivery attempt. Return values
+    # are ignored, so a plugin cannot suppress or alter delivery.
+    "cron_output_finalized",
     "pre_llm_call",
     "post_llm_call",
     # Streaming LLM output observer hooks. Fired asynchronously off the token
