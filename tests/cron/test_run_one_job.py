@@ -13,6 +13,12 @@ extracted helper directly.
 import cron.scheduler as s
 
 
+def test_cron_output_finalized_hook_is_supported():
+    from hermes_cli.plugins import VALID_HOOKS
+
+    assert "cron_output_finalized" in VALID_HOOKS
+
+
 def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final response",
                     error=None, silent_marker_in=None):
     """Patch the job pipeline primitives and record the call order."""
@@ -64,6 +70,49 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert ok is True
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
     assert calls[-1] == ("mark", "j2", True)
+
+
+def test_run_one_job_finalizes_persisted_llm_output_before_delivery(monkeypatch):
+    """A post-persistence observer receives the exact saved artifact before delivery."""
+    order = []
+    observed = {}
+
+    def fake_run_job(job, *, defer_agent_teardown=None):
+        order.append("run_job")
+        job["_hermes_final_cron_session_id"] = "cron_j2_20260727_010000"
+        return True, "persisted report", "human report", None
+
+    def fake_save(job_id, output):
+        order.append("save")
+        assert (job_id, output) == ("j2", "persisted report")
+        return "/tmp/j2.md"
+
+    def fake_finalize(name, **kwargs):
+        order.append("finalize")
+        observed.update(name=name, **kwargs)
+        return "[SILENT]"
+
+    def fake_deliver(*_args, **_kwargs):
+        order.append("deliver")
+        return None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "save_job_output", fake_save)
+    monkeypatch.setattr(s, "_deliver_result", fake_deliver)
+    monkeypatch.setattr(s, "mark_job_run", lambda *_args, **_kwargs: order.append("mark"))
+    import hermes_cli.plugins as plugins
+    monkeypatch.setattr(plugins, "invoke_hook", fake_finalize)
+
+    assert s.run_one_job({"id": "j2", "name": "t"}) is True
+    assert order == ["run_job", "save", "finalize", "deliver", "mark"]
+    assert observed == {
+        "name": "cron_output_finalized",
+        "response_text": "persisted report",
+        "session_id": "cron_j2_20260727_010000",
+        "platform": "cron",
+        "artifact_path": "/tmp/j2.md",
+        "delivery_state": "PERSISTED_ONLY",
+    }
 
 
 def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path):
