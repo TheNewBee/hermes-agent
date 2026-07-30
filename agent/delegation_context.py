@@ -31,6 +31,24 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 
 
 @contextmanager
+def scheduler_parent_context() -> Iterator[None]:
+    """Mark a scheduler-owned cron run as a parent, never a delegated child.
+
+    A cron tick can be called while some unrelated caller is inside
+    ``delegated_child_context()``. The scheduler deliberately copies ContextVars
+    across its executor boundary, so that marker must be cleared *inside* the
+    copied worker context. This scope is intentionally narrow: actual
+    ``delegate_task`` children still enter ``delegated_child_context()`` and
+    retain the fail-closed subprocess marker.
+    """
+    token = _DELEGATED_CHILD_CONTEXT.set(False)
+    try:
+        yield
+    finally:
+        _DELEGATED_CHILD_CONTEXT.reset(token)
+
+
+@contextmanager
 def delegated_child_context() -> Iterator[None]:
     """Mark the current execution context as a delegate_task child."""
     token = _DELEGATED_CHILD_CONTEXT.set(True)

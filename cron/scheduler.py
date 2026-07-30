@@ -4235,12 +4235,22 @@ def tick(
             dispatched_job = dict(job, execution_id=execution["id"])
             _ctx = contextvars.copy_context()
 
-            def _run_and_release(j=dispatched_job, ctx=_ctx):
+            def _run_scheduler_parent(j=dispatched_job):
+                # ``copy_context`` intentionally transports scheduler-scoped
+                # state into the worker. It must not also transport an
+                # unrelated delegate_task-child marker into this independent
+                # cron parent, or Kanban subprocesses fail closed incorrectly.
+                from agent.delegation_context import scheduler_parent_context
+
+                with scheduler_parent_context():
+                    return _process_job(j)
+
+            def _run_and_release(ctx=_ctx):
                 try:
-                    return ctx.run(_process_job, j)
+                    return ctx.run(_run_scheduler_parent)
                 finally:
                     with _running_lock:
-                        _running_job_ids.discard(j["id"])
+                        _running_job_ids.discard(dispatched_job["id"])
 
             try:
                 return pool.submit(_run_and_release)

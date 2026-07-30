@@ -553,6 +553,42 @@ class TestRunJobSessionPersistence:
         run_one.assert_not_called()
 
 
+class TestCronParentContextBoundary:
+    def test_tick_clears_delegated_child_context_for_scheduler_owned_cron(self):
+        """A cron parent must not inherit a caller's delegate-child marker.
+
+        The scheduler intentionally copies ContextVars into its worker thread.
+        Before the parent boundary reset, a tick called from a delegate_task
+        context copied that marker into the cron parent, and its Kanban CLI
+        subprocesses were denied as if they were actual delegated children.
+        """
+        from agent.delegation_context import delegated_child_context, is_delegated_child_context
+        from cron.scheduler import tick
+
+        job = {
+            "id": "cron-parent-context",
+            "name": "cron parent context",
+            "schedule": {"kind": "interval", "seconds": 60},
+            "next_run_at": "2020-01-01T00:00:00+00:00",
+            "enabled": True,
+        }
+        observed_contexts = []
+
+        def assert_parent_context(*_args, **_kwargs):
+            observed_contexts.append(is_delegated_child_context())
+            return True
+
+        with patch("cron.scheduler.get_due_jobs", return_value=[job]), \
+             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.run_one_job", side_effect=assert_parent_context):
+            with delegated_child_context():
+                assert tick(verbose=False, sync=True) == 1
+                # The caller itself remains a genuine delegated child.
+                assert is_delegated_child_context() is True
+
+        assert observed_contexts == [False]
+
+
 class TestRunJobConfigLogging:
     """Verify that config.yaml parse failures are logged, not silently swallowed."""
 
