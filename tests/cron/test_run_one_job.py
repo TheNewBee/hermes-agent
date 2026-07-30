@@ -60,6 +60,39 @@ def test_tick_process_job_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j1", True)
 
 
+def test_tick_does_not_propagate_delegated_child_context_to_cron_parent(monkeypatch):
+    """A scheduler-owned cron run must retain Kanban authority.
+
+    ``tick`` uses ``copy_context`` to bridge request-local state into a worker
+    thread. A caller can itself be a delegated child, but a scheduled job is a
+    scheduler parent, not that child's descendant. Propagating the child marker
+    made every Kanban operation fail closed inside PM cron jobs.
+    """
+    from agent.delegation_context import (
+        delegated_child_context,
+        is_delegated_child_process_context,
+    )
+
+    # The test runner itself may be a delegated child. The regression is about
+    # copied *ContextVar* state, so remove any inherited process marker before
+    # establishing the test's child scope.
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+
+    seen = []
+    monkeypatch.setattr(s, "get_due_jobs", lambda: [{"id": "j-context", "name": "t"}])
+    monkeypatch.setattr(s, "advance_next_run", lambda _: True)
+    monkeypatch.setattr(
+        s,
+        "run_one_job",
+        lambda *args, **kwargs: seen.append(is_delegated_child_process_context()) or True,
+    )
+
+    with delegated_child_context():
+        s.tick(verbose=False, sync=True)
+
+    assert seen == [False]
+
+
 def test_run_one_job_success_sequence(monkeypatch):
     """The extracted helper runs the same execute→save→deliver→mark sequence
     for a successful job."""

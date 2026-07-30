@@ -40,6 +40,23 @@ def delegated_child_context() -> Iterator[None]:
         _DELEGATED_CHILD_CONTEXT.reset(token)
 
 
+@contextmanager
+def cron_parent_context() -> Iterator[None]:
+    """Run a scheduler-owned cron job outside a caller's child lineage.
+
+    ``cron.scheduler.tick`` copies ContextVars into its worker threads so
+    per-request state remains available.  A cron execution is nevertheless a
+    scheduler parent: it must not inherit a surrounding ``delegate_task``
+    child's no-Kanban-mutation authority.  This only resets the ContextVar;
+    an explicit process environment marker remains a hard child boundary.
+    """
+    token = _DELEGATED_CHILD_CONTEXT.set(False)
+    try:
+        yield
+    finally:
+        _DELEGATED_CHILD_CONTEXT.reset(token)
+
+
 def is_delegated_child_context() -> bool:
     """Return True while code is running for a delegate_task child."""
     return bool(_DELEGATED_CHILD_CONTEXT.get())
