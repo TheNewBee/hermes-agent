@@ -4171,7 +4171,20 @@ def tick(
 
             def _run_and_release(j=dispatched_job, ctx=_ctx):
                 try:
-                    return ctx.run(_process_job, j)
+                    # A scheduled job is a scheduler parent, never a
+                    # ``delegate_task`` child.  ``copy_context`` preserves
+                    # useful per-tick state, but it also used to propagate a
+                    # caller's delegated-child marker into the cron agent and
+                    # its terminal subprocesses, denying its Kanban closure
+                    # authority.  Retain the copied context while explicitly
+                    # resetting only that child-local marker for this job.
+                    def _run_as_cron_parent():
+                        from agent.delegation_context import cron_parent_context
+
+                        with cron_parent_context():
+                            return _process_job(j)
+
+                    return ctx.run(_run_as_cron_parent)
                 finally:
                     with _running_lock:
                         _running_job_ids.discard(j["id"])
