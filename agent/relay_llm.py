@@ -821,37 +821,14 @@ def _complete_logical(
     if logical is None:
         return
     turn, handle, request_id = logical
-    lease = turn.lease
-    if not isinstance(lease.host, relay_runtime.RelayRuntime):
-        return
-    with turn.finalize_lock:
-        with turn.logical_llm_lock:
-            if turn.logical_llm_calls.get(request_id) is not handle:
-                return
-        if lease.session is None:
+    with turn.logical_llm_lock:
+        if turn.logical_llm_calls.get(request_id) is not handle:
             return
-        try:
-            lease.host.run_in_session(
-                lease.session,
-                lease.host.relay.scope.pop,
-                handle,
-                output={"outcome": outcome},
-                metadata={
-                    relay_runtime.RUNTIME_SCHEMA_KEY: relay_runtime.RUNTIME_SCHEMA_VERSION,
-                    relay_runtime.RUNTIME_INSTANCE_KEY: lease.host.runtime_id,
-                },
-            )
-        except Exception:
-            # The provider result is authoritative. Retain the handle so turn
-            # finalization can retry cleanup without changing that result.
-            logger.warning(
-                "Hermes Relay logical LLM finalization failed",
-                exc_info=True,
-            )
-            return
-        with turn.logical_llm_lock:
-            if turn.logical_llm_calls.get(request_id) is handle:
-                turn.logical_llm_calls.pop(request_id, None)
+    relay_runtime.SESSION_COORDINATOR.complete_logical_call(
+        turn,
+        request_id=request_id,
+        outcome=outcome,
+    )
 
 
 def _recover_successful_callback(

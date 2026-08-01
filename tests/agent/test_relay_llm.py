@@ -12,7 +12,7 @@ import pytest
 
 pytest.importorskip("nemo_relay")
 
-from agent import relay_llm, relay_runtime
+from agent import relay_llm, relay_runtime, relay_tools
 
 
 @pytest.fixture()
@@ -398,6 +398,156 @@ def test_non_stream_defers_logical_success_and_reuses_scope_for_retry(relay_turn
     relay_llm.complete_logical_call("request-retry", outcome="success")
 
     assert turn.logical_llm_calls == {}
+
+
+def test_nested_logical_completion_drains_in_lifo_order(relay_turn, monkeypatch):
+    relay, turn = relay_turn
+    events = []
+    original_pop = relay.scope.pop
+    pop_handles = []
+
+    def record_pop(handle, **kwargs):
+        pop_handles.append(handle)
+        return original_pop(handle, **kwargs)
+
+    monkeypatch.setattr(relay.scope, "pop", record_pop)
+    relay.subscribers.register("test-nested-logical-completion", events.append)
+    try:
+        relay_llm.execute(
+            {"model": "test-model", "messages": []},
+            lambda _request: {"content": "first"},
+            session_id="session-1",
+            name="test-provider",
+            model_name="test-model",
+            metadata={"api_mode": "custom", "api_request_id": "request-first"},
+            defer_logical_completion=True,
+        )
+        first_handle = turn.logical_llm_calls["request-first"]
+        relay_llm.execute(
+            {"model": "test-model", "messages": []},
+            lambda _request: {"content": "second"},
+            session_id="session-1",
+            name="test-provider",
+            model_name="test-model",
+            metadata={"api_mode": "custom", "api_request_id": "request-second"},
+            defer_logical_completion=True,
+        )
+        second_handle = turn.logical_llm_calls["request-second"]
+
+        relay_llm.complete_logical_call("request-first", outcome="success")
+
+        assert pop_handles == []
+        assert set(turn.logical_llm_calls) == {"request-first", "request-second"}
+
+        relay_llm.complete_logical_call("request-second", outcome="success")
+
+        assert pop_handles == [second_handle, first_handle]
+        assert turn.logical_llm_calls == {}
+        result, _ = relay_tools.execute(
+            "write_file",
+            {"path": "audit"},
+            lambda args: {"persisted": args["path"]},
+            session_id="session-1",
+            metadata={"tool_call_id": "tool-after-nested-llm"},
+        )
+        assert result == {"persisted": "audit"}
+
+        relay_runtime.SESSION_COORDINATOR.end_turn(turn, outcome="success")
+        relay_runtime.SESSION_COORDINATOR.finalize_conversation(
+            profile_key=turn.lease.profile_key,
+            session_id="session-1",
+        )
+    finally:
+        relay.subscribers.deregister("test-nested-logical-completion")
+
+    scope_ends = [
+        (event.category, event.scope_category, event.name)
+        for event in events
+        if event.kind == "scope" and event.scope_category == "end"
+    ]
+    assert ("tool", "end", "write_file") in scope_ends
+    assert scope_ends[-2:] == [
+        ("function", "end", relay_runtime.TURN_SCOPE),
+        ("agent", "end", relay_runtime.SESSION_SCOPE),
+    ]
+
+
+def test_nested_logical_finalization_recovers_after_top_pop_failure(
+    relay_turn, monkeypatch
+):
+    relay, turn = relay_turn
+    original_pop = relay.scope.pop
+    pop_handles = []
+    fail_second_once = True
+
+    relay_llm.execute(
+        {"model": "test-model", "messages": []},
+        lambda _request: {"content": "first"},
+        session_id="session-1",
+        name="test-provider",
+        model_name="test-model",
+        metadata={"api_mode": "custom", "api_request_id": "request-first"},
+        defer_logical_completion=True,
+    )
+    first_handle = turn.logical_llm_calls["request-first"]
+    relay_llm.execute(
+        {"model": "test-model", "messages": []},
+        lambda _request: {"content": "second"},
+        session_id="session-1",
+        name="test-provider",
+        model_name="test-model",
+        metadata={"api_mode": "custom", "api_request_id": "request-second"},
+        defer_logical_completion=True,
+    )
+    second_handle = turn.logical_llm_calls["request-second"]
+
+    def fail_second_pop_once(handle, **kwargs):
+        nonlocal fail_second_once
+        pop_handles.append(handle)
+        if handle is second_handle and fail_second_once:
+            fail_second_once = False
+            raise RuntimeError("simulated top logical scope close failure")
+        return original_pop(handle, **kwargs)
+
+    monkeypatch.setattr(relay.scope, "pop", fail_second_pop_once)
+    relay_llm.complete_logical_call("request-first", outcome="success")
+    relay_llm.complete_logical_call("request-second", outcome="success")
+
+    assert set(turn.logical_llm_calls) == {"request-first", "request-second"}
+
+    relay_runtime.SESSION_COORDINATOR.finish_logical_calls(turn, outcome="success")
+
+    assert pop_handles == [second_handle, second_handle, first_handle]
+    assert turn.logical_llm_calls == {}
+    events = []
+    relay.subscribers.register("test-nested-logical-recovery", events.append)
+    try:
+        result, _ = relay_tools.execute(
+            "write_file",
+            {"path": "audit-after-retry"},
+            lambda args: {"persisted": args["path"]},
+            session_id="session-1",
+            metadata={"tool_call_id": "tool-after-retry"},
+        )
+        assert result == {"persisted": "audit-after-retry"}
+        relay_runtime.SESSION_COORDINATOR.end_turn(turn, outcome="success")
+        relay_runtime.SESSION_COORDINATOR.finalize_conversation(
+            profile_key=turn.lease.profile_key,
+            session_id="session-1",
+        )
+    finally:
+        relay.subscribers.deregister("test-nested-logical-recovery")
+
+    scope_ends = [
+        (event.category, event.scope_category, event.name)
+        for event in events
+        if event.kind == "scope" and event.scope_category == "end"
+    ]
+    assert ("tool", "end", "write_file") in scope_ends
+    assert scope_ends[-2:] == [
+        ("function", "end", relay_runtime.TURN_SCOPE),
+        ("agent", "end", relay_runtime.SESSION_SCOPE),
+    ]
 
 
 def test_non_stream_result_survives_logical_scope_close_failure(
