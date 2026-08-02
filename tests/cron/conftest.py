@@ -19,3 +19,15 @@ def _default_cron_test_model(monkeypatch):
     """Pin a default HERMES_MODEL so cron run_job tests have a resolvable model."""
     monkeypatch.setenv("HERMES_MODEL", "test-cron-default-model")
     yield
+
+
+@pytest.fixture(autouse=True)
+def _default_cron_skill_integrity_pass(monkeypatch):
+    """Keep unrelated scheduler tests focused on their own execution seam.
+
+    Dependency-integrity behavior is covered explicitly in
+    ``TestRunJobDependencyIntegrity``; ordinary cron tests should not require a
+    live canonical skills checkout in their temporary HERMES_HOME.
+    """
+    monkeypatch.setattr("cron.scheduler._validate_cron_skill_dependencies", lambda: [])
+    yield
