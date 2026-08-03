@@ -259,9 +259,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     try:
         descriptor = os.open(path, flags)
     except (OSError, ValueError):
-        # ValueError covers malformed paths such as an embedded NUL from a
-        # binary-like remote script response. Ignore only that reference so
-        # the caller can continue scanning later command/script segments.
+        # OSError covers unreadable, missing, and over-long paths; ValueError
+        # covers an embedded NUL from a binary-like remote script response.
+        # Ignore only that reference so later command/script segments are still
+        # scanned and the gateway guard remains total.
         return None, False
     try:
         metadata = os.fstat(descriptor)
