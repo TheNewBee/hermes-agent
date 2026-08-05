@@ -331,8 +331,10 @@ class EventBridge:
         self._last_poll_timestamps: Dict[str, float] = {}  # session_key -> unix timestamp
         # In-memory approval tracking (populated from events)
         self._pending_approvals: Dict[str, dict] = {}
-        # mtime cache — skip expensive work when state.db hasn't changed
-        self._state_db_mtime: float = 0.0
+        # Nanosecond mtime cache — skip expensive work when state.db hasn't changed.
+        # A float timestamp loses sub-microsecond precision at current epochs,
+        # which can suppress a just-written message or spuriously re-poll.
+        self._state_db_mtime: int = 0
         self._cached_sessions_index: dict = {}
 
     def start(self):
@@ -466,9 +468,9 @@ class EventBridge:
         except ImportError:
             db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
         try:
-            self._state_db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
+            self._state_db_mtime = db_file.stat().st_mtime_ns if db_file.exists() else 0
         except OSError:
-            self._state_db_mtime = 0.0
+            self._state_db_mtime = 0
         try:
             self._cached_sessions_index = _load_sessions_index()
         except Exception:
@@ -519,9 +521,9 @@ class EventBridge:
             db_file = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")) / "state.db"
 
         try:
-            db_mtime = db_file.stat().st_mtime if db_file.exists() else 0.0
+            db_mtime = db_file.stat().st_mtime_ns if db_file.exists() else 0
         except OSError:
-            db_mtime = 0.0
+            db_mtime = 0
 
         if db_mtime == self._state_db_mtime:
             return  # Nothing changed since last poll — skip entirely
@@ -531,6 +533,13 @@ class EventBridge:
         # it's a single indexed query and it can never lag the messages
         # table (both live in the same database file).
         self._cached_sessions_index = _load_sessions_index()
+        # Opening the index's SessionDB can initialize SQLite metadata and
+        # advance the database mtime. Cache the post-read value so local
+        # read-side housekeeping does not force a redundant full poll.
+        try:
+            self._state_db_mtime = db_file.stat().st_mtime_ns if db_file.exists() else 0
+        except OSError:
+            self._state_db_mtime = 0
         entries = self._cached_sessions_index
 
         for session_key, entry in entries.items():
