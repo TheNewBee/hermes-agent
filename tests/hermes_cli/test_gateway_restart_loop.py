@@ -695,6 +695,30 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_malformed_remote_script_reference_cannot_bypass_lifecycle_guard(
+        self, tmp_path
+    ):
+        """A binary-like remote script token with a NUL path must neither crash
+        scanning nor prevent a later referenced lifecycle command from blocking.
+
+        Remote backends can return an executable's binary bytes through their
+        script-read fallback.  The normal terminal command ``./remote-helper``
+        must keep scanning subsequent references even when the first binary-like
+        token cannot be opened as a filesystem path.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        (tmp_path / "unsafe.sh").write_text("#!/bin/sh\nhermes gateway restart\n")
+        remote_binary_like_script = "./binary\x00token; ./unsafe.sh"
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "./remote-helper",
+            cwd=str(tmp_path),
+            read_remote_script=lambda _path: remote_binary_like_script,
+        )
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
