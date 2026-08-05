@@ -21,6 +21,7 @@ These tests pin the new probe ladder:
 from __future__ import annotations
 
 import subprocess
+from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -166,6 +167,18 @@ class TestDetectAudioEnvironmentTermuxFallback:
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("SSH_CONNECTION", raising=False)
+
+        # This fixture simulates Termux, not WSL.  On a WSL host the real
+        # /proc/version adds an unrelated audio-forwarding warning which can
+        # turn availability false before the Termux fallback is evaluated.
+        real_open = open
+
+        def _non_wsl_proc_version(path, *args, **kwargs):
+            if str(path) == "/proc/version":
+                return StringIO("Linux version")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", _non_wsl_proc_version)
 
         # No sounddevice — we go down the Termux:API branch.
         monkeypatch.setattr(
