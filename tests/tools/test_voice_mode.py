@@ -198,12 +198,13 @@ class TestDetectAudioEnvironment:
         assert result["warnings"] == []
         assert any("SSH" in n for n in result.get("notices", []))
 
-    def test_wsl_without_pulse_blocks_voice(self, monkeypatch, tmp_path):
-        """WSL without PULSE_SERVER should block voice mode."""
+    def test_wsl_without_forwarding_blocks_voice(self, monkeypatch, tmp_path):
+        """WSL without audio forwarding should block voice mode."""
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("SSH_CONNECTION", raising=False)
         monkeypatch.delenv("PULSE_SERVER", raising=False)
+        monkeypatch.delenv("PIPEWIRE_REMOTE", raising=False)
         monkeypatch.setattr("tools.voice_mode._pulse_socket_reachable", lambda: False)
         monkeypatch.setattr("tools.voice_mode._import_audio",
                             lambda: (MagicMock(), MagicMock()))
@@ -1515,10 +1516,7 @@ class TestWSL2PowerShellFallback:
 
 
 class TestWSLAudioEnvironmentGate:
-    """Regression tests (review of #63768) for detect_audio_environment()'s
-    WSL gate: when the PowerShell TTS fallback is viable, voice mode must
-    not be hard-blocked, but the recording/STT PulseAudio-bridge guidance
-    must still be surfaced (as a non-blocking notice)."""
+    """Regression tests for WSL audio forwarding and the TTS-only fallback."""
 
     def _fake_open_wsl(self, path, *args, **kwargs):
         if str(path) == "/proc/version":
@@ -1526,7 +1524,7 @@ class TestWSLAudioEnvironmentGate:
             return io.StringIO("Linux version 5.15 Microsoft Standard WSL2")
         return open(path, *args, **kwargs)
 
-    def test_wsl_no_pulse_but_powershell_available_not_hard_blocked(self, monkeypatch):
+    def test_wsl_no_forwarding_with_powershell_blocks_voice(self, monkeypatch):
         from unittest.mock import patch
         from tools import voice_mode as vm
 
@@ -1542,15 +1540,15 @@ class TestWSLAudioEnvironmentGate:
              patch("hermes_constants.is_container", return_value=False):
             result = vm.detect_audio_environment()
 
-        assert result["available"] is True, (
-            "PowerShell TTS fallback must keep voice mode enabled even "
-            "without a PulseAudio bridge: " + str(result["warnings"])
+        assert result["available"] is False, (
+            "PowerShell TTS fallback cannot enable voice input without "
+            "audio forwarding: " + str(result["warnings"])
         )
         assert any("PowerShell" in n or "Media.SoundPlayer" in n for n in result["notices"]), (
             "The PowerShell fallback path must be mentioned in notices"
         )
-        assert any("recording" in n.lower() or "PulseAudio" in n for n in result["notices"]), (
-            "The recording/STT PulseAudio caveat must still be surfaced"
+        assert any("WSL" in warning for warning in result["warnings"]), (
+            "The missing forwarding must remain a hard WSL warning"
         )
 
     def test_wsl_no_pulse_no_powershell_still_blocked(self, monkeypatch):
@@ -1569,10 +1567,7 @@ class TestWSLAudioEnvironmentGate:
              patch("hermes_constants.is_container", return_value=False):
             result = vm.detect_audio_environment()
 
-        assert result["available"] is False, (
-            "Without PulseAudio AND without the PowerShell fallback, WSL "
-            "must still be hard-blocked as before"
-        )
+        assert result["available"] is False, "Without forwarded audio, WSL must remain hard-blocked"
 
     def test_wsl_with_pulse_server_unaffected(self, monkeypatch):
         """PULSE_SERVER already configured: existing behavior unchanged."""

@@ -326,14 +326,10 @@ def detect_audio_environment() -> dict:
 
     # WSL detection — a reachable sound server makes audio work in WSL.
     # Honor any forwarding (PulseAudio bridge OR a forwarded PipeWire/Pulse
-    # socket), mirroring the SSH and container blocks above. When no
-    # forwarding is configured, only hard-block if the WSL2 PowerShell TTS
-    # fallback (Media.SoundPlayer via powershell.exe, see play_audio_file)
-    # isn't available either. The PowerShell path only covers OUTPUT (TTS
-    # playback) -- microphone recording genuinely still needs the
-    # PulseAudio bridge -- so when it's the only thing available we
-    # downgrade to a notice (keeps the same recording guidance visible,
-    # but doesn't block /voice on for TTS-only usage).
+    # socket), mirroring the SSH and container blocks above. The WSL2
+    # PowerShell TTS fallback (Media.SoundPlayer via powershell.exe, see
+    # play_audio_file) only covers OUTPUT, so it must not enable voice mode
+    # when microphone capture has no forwarded sound server.
     try:
         with open('/proc/version', 'r', encoding="utf-8") as f:
             if 'microsoft' in f.read().lower():
@@ -343,12 +339,8 @@ def detect_audio_environment() -> dict:
                     notices.append(
                         "Running in WSL without a PulseAudio bridge -- TTS playback "
                         "will use the PowerShell/Media.SoundPlayer fallback. "
-                        "Voice INPUT (recording) still requires a PulseAudio bridge:\n"
-                        "  1. Set PULSE_SERVER=unix:/mnt/wslg/PulseServer\n"
-                        "  2. Create ~/.asoundrc pointing ALSA at PulseAudio\n"
-                        "  3. Verify with: arecord -d 3 /tmp/test.wav && aplay /tmp/test.wav"
                     )
-                else:
+                if not has_forwarded_audio:
                     warnings.append(
                         "Running in WSL -- audio requires a forwarded sound server.\n"
                         "  PulseAudio: export PULSE_SERVER=unix:/mnt/wslg/PulseServer\n"
