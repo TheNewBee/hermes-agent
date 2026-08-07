@@ -941,6 +941,98 @@ class TestRunJobSkillBacked:
         assert final_response == "ok"
 
 
+class TestRunJobDependencyIntegrity:
+    """Agent-backed jobs must stop before prompt or agent construction on a bad skill package."""
+
+    @pytest.mark.parametrize(
+        "finding_code",
+        [
+            "skill_missing",
+            "package_worktree_dirty",
+            "canonical_worktree_dirty",
+            "package_tree_mismatch",
+            "binding_mismatch",
+            "validator_invalid_output",
+        ],
+    )
+    def test_skill_integrity_finding_returns_explicit_failure_before_prompt_build(
+        self, finding_code
+    ):
+        job = {
+            "id": "integrity-job",
+            "name": "integrity check",
+            "prompt": "produce a report",
+            "skills": ["alpha"],
+        }
+        findings = [{"code": finding_code, "detail": "skill=alpha"}]
+        agent = MagicMock()
+        agent.run_conversation.return_value = {"final_response": "ok"}
+
+        with patch(
+            "cron.scheduler._validate_cron_skill_dependencies",
+            create=True,
+            return_value=findings,
+        ) as validate, patch("cron.scheduler._build_job_prompt") as build_prompt, patch(
+            "hermes_state.SessionDB", return_value=MagicMock()
+        ), patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://example.invalid/v1",
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+            },
+        ), patch("run_agent.AIAgent", return_value=agent) as agent_cls:
+            success, document, final_response, error = run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error == f"dependency_integrity_failure: {finding_code}"
+        assert "Dependency integrity failure" in document
+        assert finding_code in document
+        validate.assert_called_once_with()
+        build_prompt.assert_not_called()
+        agent_cls.assert_not_called()
+
+    def test_unreadable_validator_is_a_dependency_failure_before_agent_run(self, tmp_path):
+        home = tmp_path / ".hermes"
+        validator = home / "skills" / "tools" / "cron-skill-control" / "cron_skill_control.py"
+        validator.parent.mkdir(parents=True)
+        validator.write_text("print('not-json')\n", encoding="utf-8")
+        job = {
+            "id": "unreadable-validator-job",
+            "name": "unreadable validator",
+            "prompt": "produce a report",
+            "skills": ["alpha"],
+        }
+
+        import importlib
+        import cron.scheduler as scheduler
+
+        importlib.reload(scheduler)
+        agent = MagicMock()
+        agent.run_conversation.return_value = {"final_response": "ok"}
+        with patch("cron.scheduler._get_hermes_home", return_value=home), patch(
+            "cron.scheduler._build_job_prompt"
+        ) as build_prompt, patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value={
+                "api_key": "test-key",
+                "base_url": "https://example.invalid/v1",
+                "provider": "openrouter",
+                "api_mode": "chat_completions",
+            },
+        ), patch("run_agent.AIAgent", return_value=agent) as agent_cls:
+            success, document, final_response, error = scheduler.run_job(job)
+
+        assert success is False
+        assert final_response == ""
+        assert error == "dependency_integrity_failure: validator_invalid_output"
+        assert "validator_invalid_output" in document
+        build_prompt.assert_not_called()
+        agent_cls.assert_not_called()
+
+
 class TestSilentDelivery:
     """Verify that [SILENT] responses suppress delivery while still saving output."""
 
