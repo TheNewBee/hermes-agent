@@ -154,12 +154,16 @@ class TestResolveDeliveryTarget:
             },
         }
 
-        with patch("gateway.channel_directory.resolve_channel_name", return_value=None):
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="C0BNGBT5H5F:directory-thread",
+        ) as resolve_mock:
             assert _resolve_delivery_target(job) == {
                 "platform": "slack",
                 "chat_id": "C0BNGBT5H5F",
                 "thread_id": None,
             }
+        resolve_mock.assert_not_called()
 
 
     def test_explicit_slack_thread_target_preserves_thread(self):
@@ -172,12 +176,16 @@ class TestResolveDeliveryTarget:
             },
         }
 
-        with patch("gateway.channel_directory.resolve_channel_name", return_value=None):
+        with patch(
+            "gateway.channel_directory.resolve_channel_name",
+            return_value="C0BNGBT5H5F:directory-thread",
+        ) as resolve_mock:
             assert _resolve_delivery_target(job) == {
                 "platform": "slack",
                 "chat_id": "C0BNGBT5H5F",
                 "thread_id": "171.123",
             }
+        resolve_mock.assert_not_called()
 
 
     def test_telegram_cron_thread_id_overrides_home_thread_id(self, monkeypatch):
