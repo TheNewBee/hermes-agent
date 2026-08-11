@@ -88,7 +88,11 @@ from agent.retry_utils import (
 from agent.trajectory import has_incomplete_scratchpad
 # Bind before the turn starts so a source-tree swap cannot load a skewed
 # finalizer at turn end.
-from agent.turn_finalizer import finalize_turn
+from agent.turn_finalizer import (
+    _PRE_VERIFY_FALLBACK_SOURCES,
+    _pre_verify_continuation_for_candidate,
+    finalize_turn,
+)
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
@@ -1598,6 +1602,14 @@ def run_conversation(
     # reused as the final response — not merely because any interim was
     # streamed. (#65919 review: response-loss blocker)
     _pending_verification_response_previewed = False
+    # Provenance keeps the ownership fallback scoped to the two completion
+    # gates that require it. Kanban stop uses the same pending-response slot
+    # but must retain its existing terminal-tool behavior.
+    _pending_verification_source = None
+    # A pre-existing grace flag already represents this turn's one allowance.
+    # Once consumed, a second rejection must finalize fail-closed instead of
+    # recursively arming another provider call.
+    _pre_verify_budget_grace_used = bool(agent._budget_grace_call)
     # If pre-API compression fires after MoA advisors have produced guidance,
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
@@ -1631,7 +1643,106 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    def _finalize_current_turn(*, allow_pre_verify_budget_grace=False):
+        result = finalize_turn(
+            agent,
+            final_response=final_response,
+            api_call_count=api_call_count,
+            interrupted=interrupted,
+            failed=failed,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            _should_review_memory=_should_review_memory,
+            _turn_exit_reason=_turn_exit_reason,
+            _pending_verification_response=_pending_verification_response,
+            _pending_verification_response_previewed=(
+                _pending_verification_response_previewed
+            ),
+            _pending_verification_source=_pending_verification_source,
+            _allow_pre_verify_budget_grace=allow_pre_verify_budget_grace,
+        )
+        # A grace allowance belongs to this turn only. The normal provider
+        # path consumes it, but an interrupt/redirect can finalize before that
+        # call starts; never let the flag leak into a later user turn.
+        if not result.get("_retry_with_budget_grace"):
+            agent._budget_grace_call = False
+        return result
+
+    while (
+        api_call_count < agent.max_iterations
+        and agent.iteration_budget.remaining > 0
+    ) or agent._budget_grace_call or (
+        _pending_verification_response is not None
+        and _pending_verification_source in _PRE_VERIFY_FALLBACK_SOURCES
+    ):
+        _has_regular_iteration = (
+            api_call_count < agent.max_iterations
+            and agent.iteration_budget.remaining > 0
+        )
+        if (
+            not _has_regular_iteration
+            and not agent._budget_grace_call
+            and _pending_verification_response is not None
+            and _pending_verification_source
+            in _PRE_VERIFY_FALLBACK_SOURCES
+        ):
+            # Reconsider the held candidate at the common finalizer. At the
+            # ordinary API-call cap only, a rejection may consume the loop's
+            # existing one-call grace allowance. Shared-budget exhaustion does
+            # not get to exceed its owner.
+            _fallback_result = _finalize_current_turn(
+                allow_pre_verify_budget_grace=(
+                    api_call_count >= agent.max_iterations
+                    and not _pre_verify_budget_grace_used
+                )
+            )
+            if not _fallback_result.get("_retry_with_budget_grace"):
+                return _fallback_result
+
+            _continuation_directive = _fallback_result[
+                "continuation_directive"
+            ]
+            # The common-finalizer recheck is a real ownership attempt. Move
+            # the counter forward before the recovery response is evaluated so
+            # hooks do not see the same attempt number twice.
+            agent._pre_verify_nudges = (
+                getattr(agent, "_pre_verify_nudges", 0) + 1
+            )
+            _pre_verify_budget_grace_used = True
+            agent._budget_grace_call = True
+            _pending_verification_response = None
+            _pending_verification_response_previewed = False
+            _pending_verification_source = None
+
+            # Reuse the existing synthetic continuation row so role
+            # alternation stays intact and the recovery provider call sees the
+            # finalizer's current ownership directive.
+            for _message in reversed(messages):
+                if not isinstance(_message, dict):
+                    continue
+                if (
+                    _message.get("role") == "user"
+                    and (
+                        _message.get("_pre_verify_synthetic")
+                        or _message.get("_verification_stop_synthetic")
+                    )
+                ):
+                    _message["content"] = _continuation_directive
+                    _message["_pre_verify_synthetic"] = True
+                    break
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": _continuation_directive,
+                    "_pre_verify_synthetic": True,
+                })
+            agent._session_messages = messages
+            continue
+
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -7464,17 +7575,32 @@ def run_conversation(
                         getattr(agent, "_verification_stop_nudges", 0) + 1
                     )
                     final_msg["finish_reason"] = "verification_required"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the verification loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
+                    _can_continue_verification = (
+                        api_call_count < agent.max_iterations
+                        and agent.iteration_budget.remaining > 0
+                    )
+                    # With ordinary continuation budget, surface the candidate
+                    # as interim progress. At the terminal boundary it must be
+                    # buffered until the common finalizer rechecks ownership;
+                    # a rejected completion claim must never reach the UI.
+                    if _can_continue_verification:
+                        agent._emit_interim_assistant_message(final_msg)
                     messages.append(final_msg)
-                    try:
-                        agent._flush_messages_to_session_db(messages, conversation_history)
-                    except Exception:
-                        logger.debug("verify-on-stop interim flush failed", exc_info=True)
+                    # A candidate with no ordinary continuation budget must
+                    # first cross the common finalizer's ownership check. Keep
+                    # it live for that decision, but do not make a potentially
+                    # rejected terminal claim append-only durable yet.
+                    if _can_continue_verification:
+                        try:
+                            agent._flush_messages_to_session_db(
+                                messages,
+                                conversation_history,
+                            )
+                        except Exception:
+                            logger.debug(
+                                "verify-on-stop interim flush failed",
+                                exc_info=True,
+                            )
                     messages.append({
                         "role": "user",
                         "content": _verify_nudge,
@@ -7497,6 +7623,7 @@ def run_conversation(
                     _pending_verification_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")
                     )
+                    _pending_verification_source = "verification_stop"
                     final_response = None
                     continue
 
@@ -7505,48 +7632,24 @@ def run_conversation(
                 # going one more turn. The shipped guidance is folded into the
                 # evidence-based verify-on-stop nudge above, so this path has no
                 # default continuation cost.
-                _verify_nudge2 = None
-                _edited = sorted(getattr(agent, "_turn_file_mutation_paths", set()) or [])
                 _attempt = getattr(agent, "_pre_verify_nudges", 0)
-                try:
-                    from agent.verify_hooks import max_verify_nudges
-                    from hermes_cli.lifecycle import has_hook
-                    from hermes_cli.plugins import get_pre_verify_continue_message
-
-                    if _edited and has_hook("pre_verify") and _attempt < max_verify_nudges():
-                        # Posture is fixed for the session — resolve once + cache.
-                        coding = getattr(agent, "_resolved_is_coding", None)
-                        if coding is None:
-                            from agent.coding_context import is_coding_context
-                            coding = bool(is_coding_context(platform=getattr(agent, "platform", "") or ""))
-                            agent._resolved_is_coding = coding
-                        _verify_nudge2 = get_pre_verify_continue_message(
-                            session_id=getattr(agent, "session_id", None) or "",
-                            platform=getattr(agent, "platform", "") or "",
-                            model=getattr(agent, "model", "") or "",
-                            coding=coding,
-                            attempt=_attempt,
-                            final_response=final_response,
-                            changed_paths=_edited,
-                        )
-                except Exception:
-                    logger.debug("pre_verify hook check failed", exc_info=True)
-                    _verify_nudge2 = None
+                _verify_nudge2 = _pre_verify_continuation_for_candidate(
+                    agent,
+                    final_response,
+                    logger,
+                    respect_nudge_limit=not _pre_verify_budget_grace_used,
+                )
 
                 if _verify_nudge2:
                     agent._pre_verify_nudges = _attempt + 1
                     final_msg["finish_reason"] = "verify_hook_continue"
-                    # The assistant response is real content — persist it and
-                    # emit to the UI as an interim message so the user sees the
-                    # attempted final answer before the pre_verify loop runs.
-                    # Only the nudge is flagged synthetic so it gets stripped
-                    # from the durable transcript (#65919 §7).
-                    agent._emit_interim_assistant_message(final_msg)
+                    # The ownership hook rejected this completion candidate.
+                    # Keep the assistant/user pair live for the bounded
+                    # continuation request, but do not emit or flush the
+                    # rejected candidate. The common finalizer removes this
+                    # flagged row unless a later ownership recheck allows it.
+                    final_msg["_pre_verify_synthetic"] = True
                     messages.append(final_msg)
-                    try:
-                        agent._flush_messages_to_session_db(messages, conversation_history)
-                    except Exception:
-                        logger.debug("pre_verify interim flush failed", exc_info=True)
                     messages.append({
                         "role": "user",
                         "content": _verify_nudge2,
@@ -7559,6 +7662,7 @@ def run_conversation(
                     _pending_verification_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")
                     )
+                    _pending_verification_source = "pre_verify"
                     final_response = None
                     continue
 
@@ -7609,6 +7713,7 @@ def run_conversation(
                     _pending_verification_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")
                     )
+                    _pending_verification_source = "kanban_stop"
                     final_response = None
                     continue
 
@@ -7731,26 +7836,9 @@ def run_conversation(
                 messages.append({"role": "assistant", "content": final_response})
                 break
     
-    # Post-loop turn finalization extracted to agent/turn_finalizer.finalize_turn
-    # (god-file decomposition Phase 1 step 4). Behavior-neutral: the assembled
-    # result dict is returned exactly as before.
-    return finalize_turn(
-        agent,
-        final_response=final_response,
-        api_call_count=api_call_count,
-        interrupted=interrupted,
-        failed=failed,
-        messages=messages,
-        conversation_history=conversation_history,
-        effective_task_id=effective_task_id,
-        turn_id=turn_id,
-        user_message=user_message,
-        original_user_message=original_user_message,
-        _should_review_memory=_should_review_memory,
-        _turn_exit_reason=_turn_exit_reason,
-        _pending_verification_response=_pending_verification_response,
-        _pending_verification_response_previewed=_pending_verification_response_previewed,
-    )
+    # Every post-loop exit, including ownership fallback, crosses the common
+    # finalizer before its result is returned.
+    return _finalize_current_turn()
 
 
 

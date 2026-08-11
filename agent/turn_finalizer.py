@@ -8,11 +8,11 @@ budget-exhaustion summary, trajectory save, session persist, turn diagnostics,
 response transforms, result-dict assembly, steer drain, and the memory/skill
 review trigger.
 
-Behavior-neutral: the body is moved unchanged. All ``agent.*`` side effects fire
-exactly as before; only the post-loop *locals* are passed in as keyword args, and
-the assembled ``result`` dict is returned to ``run_conversation`` which returns it
-to the caller. The function is synchronous with a single return — mirroring the
-region it replaces (no awaits, no early returns).
+The extraction was behavior-neutral; this module now also owns decisions that
+must be common to every post-loop exit, including verification-candidate
+fallback. All post-loop locals are passed as keyword args and the assembled
+``result`` dict is returned to ``run_conversation``. The function remains
+synchronous.
 
 Module ``logger`` is imported lazily inside the body (``from
 agent.conversation_loop import logger``) so this module never imports
@@ -43,28 +43,120 @@ def _is_pure_tool_call_tail(msg: dict) -> bool:
     return not flatten_message_text(msg.get("content")).strip()
 
 
-# Verification continuation scaffolding flags: verify-on-stop / pre_verify
-# inject a synthetic user nudge to keep the agent going one more turn.
-# These nudges must be stripped from returned/live history to avoid
-# role-alternation breaks and poisoning the resumed transcript. The
-# assistant response is real content and is not flagged. (#65919 §7)
+# Verification continuation scaffolding flags. verify-on-stop / pre_verify
+# inject a synthetic user nudge to keep the agent going one more turn; the
+# ownership fallback also marks an assistant candidate only after rejecting
+# it. Allowed assistant responses remain real, unflagged content. All flagged
+# rows must be stripped to preserve role alternation and resumed history.
+# (#65919 §7)
 _VERIFICATION_CONTINUATION_FLAGS = (
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+)
+
+_PRE_VERIFY_FALLBACK_SOURCES = frozenset({"pre_verify", "verification_stop"})
+_PRE_VERIFY_HOOK_FAILURE_CONTINUATION = (
+    "The pre-verify completion check failed. Continue working and retry "
+    "verification before reporting completion."
 )
 
 
 def _drop_verification_continuation_scaffolding(messages) -> None:
     """Remove verification-continuation nudge messages from *messages* in place.
 
-    Only the synthetic nudges carry these flags, so this strips just the
-    nudges while preserving the real attempted-final-answer that was
-    persisted to state.db.
+    This strips synthetic nudges and any candidate the ownership boundary
+    rejected, while preserving allowed attempted-final answers.
     """
     messages[:] = [
         m for m in messages
         if not (isinstance(m, dict) and any(m.get(f) for f in _VERIFICATION_CONTINUATION_FLAGS))
     ]
+
+
+def _pre_verify_continuation_for_candidate(
+    agent,
+    candidate,
+    logger,
+    *,
+    respect_nudge_limit=False,
+):
+    """Return the ownership hook's continuation directive for *candidate*.
+
+    A held completion candidate is allowed only when the configured
+    ``pre_verify`` boundary can be evaluated successfully. Hook failures are
+    therefore a fail-closed continuation, not permission to publish the held
+    answer.
+    """
+    changed_paths = sorted(
+        getattr(agent, "_turn_file_mutation_paths", set()) or []
+    )
+    if not changed_paths:
+        return None
+
+    try:
+        attempt = getattr(agent, "_pre_verify_nudges", 0)
+        if respect_nudge_limit:
+            from agent.verify_hooks import max_verify_nudges
+
+            if attempt >= max_verify_nudges():
+                return None
+
+        from hermes_cli.lifecycle import has_hook
+
+        if not has_hook("pre_verify"):
+            return None
+
+        coding = getattr(agent, "_resolved_is_coding", None)
+        if coding is None:
+            from agent.coding_context import is_coding_context
+
+            coding = bool(
+                is_coding_context(
+                    platform=getattr(agent, "platform", "") or ""
+                )
+            )
+            agent._resolved_is_coding = coding
+
+        from hermes_cli.plugins import get_pre_verify_continue_message
+
+        return get_pre_verify_continue_message(
+            session_id=getattr(agent, "session_id", None) or "",
+            platform=getattr(agent, "platform", "") or "",
+            model=getattr(agent, "model", "") or "",
+            coding=coding,
+            attempt=attempt,
+            final_response=candidate,
+            changed_paths=changed_paths,
+        )
+    except Exception:
+        logger.warning(
+            "pre_verify hook failed while evaluating a completion candidate",
+            exc_info=True,
+        )
+        return _PRE_VERIFY_HOOK_FAILURE_CONTINUATION
+
+
+def _mark_pending_candidate_rejected(messages, candidate) -> None:
+    """Mark the newest held candidate as rejected retry scaffolding."""
+    saw_continuation_nudge = False
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        if any(message.get(flag) for flag in _VERIFICATION_CONTINUATION_FLAGS):
+            saw_continuation_nudge = True
+            continue
+        if (
+            message.get("role") == "assistant"
+            and (
+                saw_continuation_nudge
+                or message.get("content") == candidate
+            )
+        ):
+            # Reuse an existing persistence-scaffolding flag: transports strip
+            # it before the recovery request, while the finalizer and SessionDB
+            # projection both drop the rejected assistant row afterward.
+            message["_pre_verify_synthetic"] = True
+            return
 
 
 def finalize_turn(
@@ -84,12 +176,10 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    _pending_verification_source=None,
+    _allow_pre_verify_budget_grace=False,
 ):
-    """Run the post-loop finalization and return the turn ``result`` dict.
-
-    Lifted verbatim from ``run_conversation`` (the region after the main agent
-    loop). See module docstring.
-    """
+    """Run common post-loop finalization and return the turn ``result`` dict."""
     from agent.conversation_loop import logger
 
     budget_exhausted = (
@@ -110,21 +200,66 @@ def finalize_turn(
 
     iteration_limit_fallback = False
     preserved_verification_fallback = False
+    pre_verify_continuation = None
     if continuation_budget_exhausted:
-        # A verification/continuation gate deliberately withheld a composed
-        # answer, then consumed the remaining budget before producing a newer
-        # one. Preserve that exact answer instead of replacing it with another
-        # fallible model call. The explicit pending value is the provenance
-        # guard: unrelated error/recovery exits can never enter this branch.
-        final_response = _pending_verification_response
-        # Mark the turn as previewed only when the reused candidate was
-        # actually streamed to the user as interim content. (#65919 review:
-        # response-loss blocker)
-        if _pending_verification_response_previewed:
-            agent._response_was_previewed = True
-        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
-        iteration_limit_fallback = True
-        preserved_verification_fallback = True
+        if _pending_verification_source in _PRE_VERIFY_FALLBACK_SOURCES:
+            pre_verify_continuation = _pre_verify_continuation_for_candidate(
+                agent,
+                _pending_verification_response,
+                logger,
+            )
+
+        if pre_verify_continuation:
+            if _allow_pre_verify_budget_grace:
+                _mark_pending_candidate_rejected(
+                    messages,
+                    _pending_verification_response,
+                )
+                return {
+                    "_retry_with_budget_grace": True,
+                    "continuation_directive": pre_verify_continuation,
+                }
+
+            # The ownership boundary rejected the held completion claim. Keep
+            # the directive observable, but never publish or durably retain the
+            # rejected candidate as the terminal answer.
+            _mark_pending_candidate_rejected(
+                messages,
+                _pending_verification_response,
+            )
+            final_response = pre_verify_continuation
+            _turn_exit_reason = "pre_verify_continuation_required"
+            iteration_limit_fallback = True
+        else:
+            # A verification/continuation gate deliberately withheld a composed
+            # answer, then consumed the remaining budget before producing a newer
+            # one. Preserve that exact answer instead of replacing it with another
+            # fallible model call. The explicit pending value is the provenance
+            # guard: unrelated error/recovery exits can never enter this branch.
+            final_response = _pending_verification_response
+            # Mark the turn as previewed only when the reused candidate was
+            # actually streamed to the user as interim content. (#65919 review:
+            # response-loss blocker)
+            if _pending_verification_response_previewed:
+                agent._response_was_previewed = True
+            else:
+                # A terminal verification candidate was intentionally buffered
+                # until this common finalizer could allow it. Preserve the
+                # existing interim-UI contract for an allowed candidate while
+                # never emitting a candidate that the ownership recheck
+                # rejected (that branch returned above).
+                _emit_interim = getattr(
+                    agent,
+                    "_emit_interim_assistant_message",
+                    None,
+                )
+                if callable(_emit_interim):
+                    _emit_interim(
+                        {"role": "assistant", "content": final_response}
+                    )
+            _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
+            iteration_limit_fallback = True
+            preserved_verification_fallback = True
     elif final_response is None and budget_fallback_eligible:
         # Budget exhausted — ask the model for a summary via one extra
         # API call with tools stripped.  _handle_max_iterations injects a
@@ -196,6 +331,7 @@ def finalize_turn(
     completed = (
         final_response is not None
         and not failed
+        and not pre_verify_continuation
         and (
             api_call_count < agent.max_iterations
             or normal_text_response
@@ -688,6 +824,8 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    if pre_verify_continuation:
+        result["continuation_directive"] = pre_verify_continuation
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in

@@ -88,12 +88,13 @@ def test_pre_verify_preserves_composed_report_at_budget_limit(agent, monkeypatch
     agent._interruptible_api_call = model_call
     agent._handle_max_iterations = MagicMock(return_value="replacement summary")
     monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+    ownership_check = MagicMock(side_effect=["run project tests", None])
 
     with (
         patch("hermes_cli.plugins.has_hook", side_effect=lambda name: name == "pre_verify"),
         patch(
             "hermes_cli.plugins.get_pre_verify_continue_message",
-            return_value="run project tests",
+            ownership_check,
         ),
         patch("agent.verify_hooks.max_verify_nudges", return_value=2),
         patch("hermes_cli.plugins.invoke_hook", return_value=[]),
@@ -101,6 +102,8 @@ def test_pre_verify_preserves_composed_report_at_budget_limit(agent, monkeypatch
         result = agent.run_conversation("edit changed.py")
 
     _assert_pending_response_survives(agent, result)
+    assert ownership_check.call_count == 2
+    assert agent._budget_grace_call is False
     # The assistant response persists (it is real, unflagged content).
     assert not result["messages"][1].get("_pre_verify_synthetic")
 
@@ -144,6 +147,218 @@ def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):
     assert result["final_response"] == "verified final report"
     assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
     assert result["completed"] is True
+    agent._handle_max_iterations.assert_not_called()
+
+
+def test_pre_verify_rejection_at_api_cap_gets_one_grace_call(agent, monkeypatch):
+    answers = iter([
+        _response("unverified completion claim"),
+        _response("verified recovery report"),
+    ])
+    provider_calls = []
+
+    def model_call(api_kwargs):
+        agent._turn_file_mutation_paths = {"changed.py"}
+        provider_calls.append(api_kwargs)
+        return next(answers)
+
+    directive = "Run the focused tests before reporting completion."
+    ownership_check = MagicMock(side_effect=[directive, directive, None])
+    agent._interruptible_api_call = model_call
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch("hermes_cli.plugins.has_hook", side_effect=lambda name: name == "pre_verify"),
+        patch(
+            "hermes_cli.plugins.get_pre_verify_continue_message",
+            ownership_check,
+        ),
+        patch("agent.verify_hooks.max_verify_nudges", return_value=1),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit changed.py")
+
+    assert result["final_response"] == "verified recovery report"
+    assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
+    assert result["completed"] is True
+    assert len(provider_calls) == 2
+    assert provider_calls[1]["messages"][-1]["content"] == directive
+    assert [message["role"] for message in result["messages"]] == [
+        "user",
+        "assistant",
+    ]
+    assert ownership_check.call_count == 3
+    assert agent._budget_grace_call is False
+    agent._handle_max_iterations.assert_not_called()
+
+
+def test_repeated_pre_verify_rejection_after_grace_fails_closed(agent, monkeypatch):
+    answers = iter([
+        _response("first unverified claim"),
+        _response("rejected recovery blocker"),
+    ])
+    provider_calls = []
+
+    def model_call(api_kwargs):
+        agent._turn_file_mutation_paths = {"changed.py"}
+        provider_calls.append(api_kwargs)
+        return next(answers)
+
+    directive = "Verification still owns this turn; continue testing."
+    delivered_interims = []
+    agent.interim_assistant_callback = (
+        lambda text, *, already_streamed=False: delivered_interims.append(text)
+    )
+    agent._interruptible_api_call = model_call
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch("hermes_cli.plugins.has_hook", side_effect=lambda name: name == "pre_verify"),
+        patch(
+            "hermes_cli.plugins.get_pre_verify_continue_message",
+            return_value=directive,
+        ),
+        patch("agent.verify_hooks.max_verify_nudges", return_value=1),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit changed.py")
+
+    assert result["final_response"] == directive
+    assert result["continuation_directive"] == directive
+    assert result["turn_exit_reason"] == "pre_verify_continuation_required"
+    assert result["completed"] is False
+    assert len(provider_calls) == 2
+    assert agent._budget_grace_call is False
+    assert delivered_interims == []
+    assert "rejected recovery blocker" not in {
+        message.get("content") for message in result["messages"]
+    }
+    assert [message["role"] for message in result["messages"]] == [
+        "user",
+        "assistant",
+    ]
+    agent._handle_max_iterations.assert_not_called()
+
+
+def test_finalizer_recheck_advances_attempt_before_grace_recovery(agent, monkeypatch):
+    answers = iter([
+        _response("unverified completion claim"),
+        _response("verified recovery report"),
+    ])
+    agent._interruptible_api_call = lambda _kwargs: (
+        setattr(agent, "_turn_file_mutation_paths", {"changed.py"})
+        or next(answers)
+    )
+    attempts = []
+
+    def ownership_check(**kwargs):
+        attempts.append(kwargs["attempt"])
+        return "Run validation before completion." if kwargs["attempt"] == 0 else None
+
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+
+    with (
+        patch(
+            "agent.verification_stop.build_verify_on_stop_nudge",
+            side_effect=["verify it", None],
+        ),
+        patch("hermes_cli.plugins.has_hook", return_value=True),
+        patch(
+            "hermes_cli.plugins.get_pre_verify_continue_message",
+            side_effect=ownership_check,
+        ),
+        patch("agent.verify_hooks.max_verify_nudges", return_value=1),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit changed.py")
+
+    assert result["final_response"] == "verified recovery report"
+    assert result["completed"] is True
+    assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
+    assert attempts == [0, 1]
+    assert agent._pre_verify_nudges == 1
+    assert agent._budget_grace_call is False
+    agent._handle_max_iterations.assert_not_called()
+
+
+def test_interrupt_during_finalizer_recheck_clears_grace_flag(agent, monkeypatch):
+    def model_call(_api_kwargs):
+        agent._turn_file_mutation_paths = {"changed.py"}
+        return _response("unverified completion claim")
+
+    hook_calls = 0
+
+    def ownership_check(**_kwargs):
+        nonlocal hook_calls
+        hook_calls += 1
+        if hook_calls == 2:
+            agent.interrupt("stop")
+        return "Continue verification."
+
+    agent._interruptible_api_call = model_call
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch("hermes_cli.plugins.has_hook", return_value=True),
+        patch(
+            "hermes_cli.plugins.get_pre_verify_continue_message",
+            side_effect=ownership_check,
+        ),
+        patch("agent.verify_hooks.max_verify_nudges", return_value=1),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit changed.py")
+
+    assert result["interrupted"] is True
+    assert result["completed"] is False
+    assert hook_calls == 2
+    assert agent._budget_grace_call is False
+
+
+def test_pre_verify_hook_exception_never_publishes_completion_claim(agent, monkeypatch):
+    provider_calls = []
+    answers = iter([
+        _response("first unverified claim"),
+        _response("rejected recovery blocker"),
+    ])
+
+    def model_call(api_kwargs):
+        agent._turn_file_mutation_paths = {"changed.py"}
+        provider_calls.append(api_kwargs)
+        return next(answers)
+
+    def raise_hook_error(**_kwargs):
+        raise RuntimeError("hook transport unavailable")
+
+    agent._interruptible_api_call = model_call
+    agent._handle_max_iterations = MagicMock(return_value="replacement summary")
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "0")
+
+    with (
+        patch("hermes_cli.plugins.has_hook", side_effect=lambda name: name == "pre_verify"),
+        patch(
+            "hermes_cli.plugins.get_pre_verify_continue_message",
+            side_effect=raise_hook_error,
+        ),
+        patch("agent.verify_hooks.max_verify_nudges", return_value=3),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+    ):
+        result = agent.run_conversation("edit changed.py")
+
+    directive = result["continuation_directive"]
+    assert "pre-verify completion check failed" in directive
+    assert result["final_response"] == directive
+    assert result["turn_exit_reason"] == "pre_verify_continuation_required"
+    assert result["completed"] is False
+    assert len(provider_calls) == 2
+    assert provider_calls[1]["messages"][-1]["content"] == directive
+    assert "rejected recovery blocker" not in {
+        message.get("content") for message in result["messages"]
+    }
     agent._handle_max_iterations.assert_not_called()
 
 
@@ -251,5 +466,3 @@ def test_streamed_interim_then_different_summary_not_marked_previewed(agent, mon
     # CRITICAL: response_previewed must be False — the interim narration was
     # NOT the final response, so the CLI must render the summary.
     assert result["response_previewed"] is False
-
-

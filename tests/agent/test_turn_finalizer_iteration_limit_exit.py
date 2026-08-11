@@ -95,6 +95,8 @@ def _finalize(
     exit_reason,
     api_call_count=60,
     pending_verification_response=None,
+    pending_verification_source=None,
+    messages=None,
 ):
     return finalize_turn(
         agent,
@@ -102,7 +104,7 @@ def _finalize(
         api_call_count=api_call_count,
         interrupted=False,
         failed=False,
-        messages=[{"role": "user", "content": "task"}],
+        messages=messages or [{"role": "user", "content": "task"}],
         conversation_history=[],
         effective_task_id="task",
         turn_id="turn",
@@ -111,6 +113,7 @@ def _finalize(
         _should_review_memory=False,
         _turn_exit_reason=exit_reason,
         _pending_verification_response=pending_verification_response,
+        _pending_verification_source=pending_verification_source,
     )
 
 
@@ -157,6 +160,7 @@ def test_pending_response_does_not_mask_later_terminal_exit(
         _should_review_memory=False,
         _turn_exit_reason=exit_reason,
         _pending_verification_response="stale premature report",
+        _pending_verification_source="pre_verify",
     )
 
     assert result["final_response"] is None
@@ -196,6 +200,80 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
 
+@pytest.mark.parametrize("pending_source", ["pre_verify", "verification_stop"])
+@pytest.mark.parametrize("api_call_count", [60, 3])
+def test_rejected_pre_verify_candidate_fails_closed_at_iteration_fallback(
+    monkeypatch, pending_source, api_call_count
+):
+    directive = "Run the focused tests before reporting completion."
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda name: name == "pre_verify")
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_pre_verify_continue_message",
+        lambda **_kwargs: directive,
+    )
+    agent = _LimitAgent()
+    agent.platform = "cli"
+    agent._resolved_is_coding = True
+    agent._turn_file_mutation_paths = {"changed.py"}
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+        api_call_count=api_call_count,
+        pending_verification_response="unverified completion claim",
+        pending_verification_source=pending_source,
+        messages=[
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "unverified completion claim"},
+            {
+                "role": "user",
+                "content": "check ownership",
+                "_pre_verify_synthetic": True,
+            },
+        ],
+    )
+
+    assert result["final_response"] == directive
+    assert result["continuation_directive"] == directive
+    assert result["turn_exit_reason"] == "pre_verify_continuation_required"
+    assert result["completed"] is False
+    assert agent._handle_max_iterations_called is False
+    assert "unverified completion claim" not in {
+        message.get("content") for message in result["messages"]
+    }
+
+
+def test_pre_verify_hook_exception_fails_closed_with_observable_directive(monkeypatch):
+    monkeypatch.setattr("hermes_cli.lifecycle.has_hook", lambda _name: True)
+
+    def raise_hook_error(**_kwargs):
+        raise RuntimeError("hook transport unavailable")
+
+    monkeypatch.setattr(
+        "hermes_cli.plugins.get_pre_verify_continue_message",
+        raise_hook_error,
+    )
+    agent = _LimitAgent()
+    agent.platform = "cli"
+    agent._resolved_is_coding = True
+    agent._turn_file_mutation_paths = {"changed.py"}
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+        pending_verification_response="unverified completion claim",
+        pending_verification_source="verification_stop",
+    )
+
+    assert result["turn_exit_reason"] == "pre_verify_continuation_required"
+    assert result["completed"] is False
+    assert result["final_response"] == result["continuation_directive"]
+    assert "pre-verify completion check failed" in result["final_response"]
+    assert agent._handle_max_iterations_called is False
+
+
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
     """When budget exhaustion preserves a verification candidate that is
     already the tail assistant message, the finalizer must NOT append a
@@ -233,5 +311,3 @@ def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch)
     assert agent.persisted_messages is not None
     persisted_roles = [m["role"] for m in agent.persisted_messages]
     assert persisted_roles == ["user", "assistant"]
-
-
