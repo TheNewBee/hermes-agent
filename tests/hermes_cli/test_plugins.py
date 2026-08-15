@@ -742,6 +742,9 @@ class TestPluginLoading:
 class TestPluginHooks:
     """Tests for lifecycle hook registration and invocation."""
 
+    def test_valid_hooks_include_cron_output_finalized(self):
+        assert "cron_output_finalized" in VALID_HOOKS
+
 
 
     def test_pre_gateway_dispatch_collects_action_dicts(self, tmp_path, monkeypatch):
