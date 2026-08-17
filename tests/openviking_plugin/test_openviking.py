@@ -941,6 +941,10 @@ class TestEnsureClientReloadsEnv:
                 return True
 
         monkeypatch.setattr(openviking_plugin, "_VikingClient", _StubClient)
+        monkeypatch.setattr(openviking_plugin, "_load_hermes_openviking_config", lambda: {})
+        monkeypatch.setattr(
+            openviking_plugin, "_openviking_endpoint_is_always_blocked", lambda _endpoint: False
+        )
         monkeypatch.setenv("OPENVIKING_ENDPOINT", "https://new.example")
         monkeypatch.setenv("OPENVIKING_API_KEY", "sk-new")
         monkeypatch.delenv("OPENVIKING_ACCOUNT", raising=False)
@@ -1075,6 +1079,10 @@ class TestEnsureClientFailureHardening:
                 return False
 
         monkeypatch.setattr(openviking_plugin, "_VikingClient", _StubClient)
+        monkeypatch.setattr(openviking_plugin, "_load_hermes_openviking_config", lambda: {})
+        monkeypatch.setattr(
+            openviking_plugin, "_openviking_endpoint_is_always_blocked", lambda _endpoint: False
+        )
         monkeypatch.setenv("OPENVIKING_ENDPOINT", "https://down.example")
         monkeypatch.setenv("OPENVIKING_API_KEY", "sk-x")
 

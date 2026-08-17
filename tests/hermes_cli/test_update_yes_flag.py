@@ -12,6 +12,8 @@ import subprocess
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from hermes_cli.main import cmd_update
 
 
@@ -45,6 +47,23 @@ def _make_run_side_effect(
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
 
     return side_effect
+
+
+@pytest.fixture(autouse=True)
+def _patch_gateway_discovery():
+    """Keep update tests independent of gateways running on the developer host.
+
+    ``cmd_update`` discovers and stops every gateway after applying an update.
+    These tests cover prompt behavior only, so a real process scan can resolve
+    a live gateway and trip the test suite's signal guard before the prompt
+    assertions run.
+    """
+    with (
+        patch("hermes_cli.gateway.find_gateway_pids", return_value=[]),
+        patch("hermes_cli.gateway.supports_systemd_services", return_value=False),
+        patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]),
+    ):
+        yield
 
 
 class TestUpdateYesConfigMigration:
