@@ -20,6 +20,8 @@ These tests pin the new probe ladder:
 
 from __future__ import annotations
 
+import builtins
+import io
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -50,6 +52,34 @@ def _make_run_dispatcher(behaviors):
 
 def _force_termux(monkeypatch):
     monkeypatch.setattr("tools.voice_mode._is_termux_environment", lambda: True)
+
+
+# Real Termux (Android) kernels never report "microsoft" in /proc/version, so
+# detect_audio_environment() must not enter the WSL branch here. The host that
+# runs this suite may itself be WSL (where /proc/version *does* contain
+# "microsoft"), which would otherwise let live WSL audio/TTS state flip the
+# termux result. Stub /proc/version to a plain Linux kernel so the WSL branch
+# is deterministically skipped regardless of the host. Mirrors the
+# _force_wsl() helper in test_voice_wsl_pipewire.py, but for the non-WSL case.
+def _force_non_wsl_proc_version(monkeypatch):
+    real_open = builtins.open
+
+    def fake_open(file, *a, **k):
+        if str(file) == "/proc/version":
+            return io.StringIO("Linux version 6.6.0-generic root@builder")
+        return real_open(file, *a, **k)
+
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+
+def _hermetic_audio_state(monkeypatch):
+    """Stub the three live host-audio selectors so local hardware/container/
+    WSL state cannot flip the termux result (issue #31015 regression guard).
+    """
+    _force_non_wsl_proc_version(monkeypatch)
+    monkeypatch.setattr("tools.voice_mode._pulse_socket_reachable", lambda: False)
+    monkeypatch.setattr("hermes_constants.is_container", lambda: False)
+    monkeypatch.setattr("tools.voice_mode._wsl_powershell_tts_available", lambda: False)
 
 
 # ── _termux_api_app_installed: probe ladder ───────────────────────────────
@@ -166,6 +196,7 @@ class TestDetectAudioEnvironmentTermuxFallback:
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("SSH_CONNECTION", raising=False)
+        _hermetic_audio_state(monkeypatch)
 
         # No sounddevice — we go down the Termux:API branch.
         monkeypatch.setattr(
@@ -217,6 +248,7 @@ class TestDetectAudioEnvironmentTermuxFallback:
         monkeypatch.delenv("SSH_CLIENT", raising=False)
         monkeypatch.delenv("SSH_TTY", raising=False)
         monkeypatch.delenv("SSH_CONNECTION", raising=False)
+        _hermetic_audio_state(monkeypatch)
 
         monkeypatch.setattr(
             "tools.voice_mode._import_audio",

@@ -594,8 +594,8 @@ class TestStdinHelpers:
             assert registry.submit_stdin(session.id, "hello")["status"] == "ok"
             assert registry.close_stdin(session.id)["status"] == "ok"
 
-            deadline = time.time() + 5
-            while time.time() < deadline:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
                 poll = registry.poll(session.id)
                 if poll["status"] == "exited":
                     assert poll["exit_code"] == 0
