@@ -137,14 +137,20 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                 current = None
             if current is loop:
                 raise RuntimeError('cron synchronous execution must run off the owner event loop')
-            return asyncio.run_coroutine_threadsafe(
+            result = asyncio.run_coroutine_threadsafe(
                 observe(lambda op, data: operation(authority, op, data)), loop).result()
-        return asyncio.run(remote())
+        else:
+            result = asyncio.run(remote())
     except Exception as exc:
         if attempted:
             raise CronExecutionUnknown(f'Cron execution unverified; reconcile {journal}: {exc}') from exc
         error = f'{type(exc).__name__}: {exc}'
         return False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error
+    # observe() ran in the owner loop's context; hand the receipt's session id to this firer's
+    # post-persistence seam (cron_output_finalized) through its own context.
+    from cron.scheduler import _cron_run_session_id
+    _cron_run_session_id.set((record.get('receipt') or {}).get('session_id') or '')
+    return result
 
 def reconcile_pending(*, allow_connect=True):
     """Observe prepared fires; never submit missing or interrupted work.
