@@ -16,11 +16,27 @@ chosen ``user_peer_id`` can be asserted without touching the network.
 
 import hashlib
 import json
+import os
 from unittest.mock import MagicMock
 
 
 from plugins.memory.honcho.client import HonchoClientConfig
 from plugins.memory.honcho.session import HonchoSessionManager
+
+
+def _set_mtime_ns(path, value_ns: int) -> None:
+    """Force an explicit ``mtime_ns`` on ``path``.
+
+    ``GatewayRunner._extract_honcho_cache_busting_config()`` memoizes the
+    honcho identity keys by ``(path, st_mtime_ns)``. Two ``write_text`` calls
+    performed within one host filesystem tick (common on coarse-timer WSL
+    mounts) can share an ``st_mtime_ns``, so the memo would serve the stale
+    first read and mask a real config flip — the exact contract this test
+    pins. Setting distinct mtimes explicitly keeps the test deterministic
+    without depending on the host timer granularity (and without touching the
+    production memoization).
+    """
+    os.utime(path, ns=(value_ns, value_ns))
 
 
 # ---------------------------------------------------------------------------
@@ -522,9 +538,13 @@ class TestPinTransition:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
         cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "Igor", "pinPeerName": True}))
+        # Distinct mtimes so the memo keyed on (path, st_mtime_ns) observes
+        # each write as a new file version even on coarse-timer filesystems.
+        _set_mtime_ns(cfg_path, 1_720_000_000_000_000_000)
         sig_pinned = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
         cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "Igor", "pinPeerName": False}))
+        _set_mtime_ns(cfg_path, 1_720_000_000_005_000_000)
         sig_unpinned = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
         assert sig_pinned["honcho.pin_peer_name"] != sig_unpinned["honcho.pin_peer_name"]
