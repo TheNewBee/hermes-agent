@@ -624,6 +624,12 @@ _running_worker_pids: dict[tuple, int] = {}
 # skips exactly this set — see ``get_restart_wait_cron_counts``.
 _scope_isolated_job_ids: set = set()
 _running_lock = threading.Lock()
+# The session a finished run belongs to, for the post-persistence ``cron_output_finalized`` seam.
+# Agent runs execute in the gateway owner, whose context never reaches the firer, so
+# ``run_canonical_job`` publishes the owner's receipt session id here; ``run_one_job`` clears and
+# resets it per fire so a stale id cannot leak across ticks (or tests sharing one context).
+_cron_run_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "cron_run_session_id", default="")
 
 # Per in-flight id: time.time() claim instant + the future owning its release (``_FUTURE_PENDING``
 # until pool.submit returns). Past-allowance with no live future = leak; the sweep force-releases.
@@ -2877,6 +2883,7 @@ def run_one_job(
     with _running_lock:
         _running_fire_owners.setdefault(_fire_key, {})[execution_token] = (
             fire_owner or None, profile_home)
+    session_token = _cron_run_session_id.set("")  # each fire starts clean: no stale session id
     try:
         with self_removal_delivery_scope(job["id"]):
             return _run_with_fire_claim_heartbeat(
@@ -2891,6 +2898,7 @@ def run_one_job(
                     transport_cancel=cancel_event,
                     execution_token=execution_token))
     finally:
+        _cron_run_session_id.reset(session_token)
         with _running_lock:
             executions = _running_fire_owners.get(_fire_key)
             if executions is not None:
@@ -3055,6 +3063,7 @@ class _RunDelivery:
     incident_acked: bool = False
     failure_incident_id: Optional[str] = None
     side_effect_ownership_lost: bool = False
+    output_file: Optional[Path] = None
 
 
 def _save_compose_deliver(
@@ -3068,7 +3077,7 @@ def _save_compose_deliver(
         if not owns_output:
             raise _FireClaimLostDuringSideEffect
         # remove_job() already deleted this job's output dir; saving would re-create an orphan.
-        output_file = (
+        output_file = d.output_file = (
             None if self_removal_delivery_allowed(job["id"])
             else save_job_output(job["id"], output))
     if verbose and output_file is not None:
@@ -3158,6 +3167,26 @@ def _save_compose_deliver(
             raise
         d.delivery_error = str(de)
         logger.error("Delivery failed for job %s: %s", job["id"], de)
+
+
+def _invoke_cron_output_finalized(
+    *, response_text: str, session_id: str, artifact_path: str, delivery_state: str,
+) -> None:
+    """Notify observers only after cron has persisted its terminal artifact. Shadow-only:
+    returns are ignored and a failing observer never affects the run."""
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook(
+            "cron_output_finalized",
+            response_text=response_text,
+            session_id=session_id,
+            platform="cron",
+            artifact_path=artifact_path,
+            delivery_state=delivery_state,
+        )
+    except Exception as exc:
+        logger.warning("cron_output_finalized hook failed: %s", exc)
 
 
 def _deliver_crash_failure(
@@ -3409,6 +3438,18 @@ def _run_one_job_body(
             from cron.scheduler_bookkeeping import finish_interrupted_run
             finish_interrupted_run(job, execution_id, delivery_error)
             return True
+
+        # Terminal-artifact observer (continuation-ledger validator): after persistence and the
+        # delivery attempt, before the run is marked. Shadow-only; delivery semantics unchanged.
+        session_id = _cron_run_session_id.get()
+        if d.success and session_id and d.output_file is not None:
+            # A completed attempt (queued, sent, or local-only routing), never a remote receipt.
+            delivery_state = (
+                "PERSISTED_ONLY" if not d.should_deliver
+                else "DELIVERY_ATTEMPTED" if d.delivery_error is None else "DELIVERY_FAILED")
+            _invoke_cron_output_finalized(
+                response_text=final_response, session_id=session_id,
+                artifact_path=str(d.output_file), delivery_state=delivery_state)
 
         from cron.scheduler_bookkeeping import finish_completed_run
         return finish_completed_run(d, fire_owner, execution_id)
