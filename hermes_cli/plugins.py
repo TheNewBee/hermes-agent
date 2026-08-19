@@ -109,6 +109,9 @@ VALID_HOOKS: set[str] = {
     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
     # transform_llm_output: return a replacement string (first non-None wins) or None.
     "transform_llm_output", "pre_llm_call", "post_llm_call",
+    # cron_output_finalized: observes a cron run's persisted terminal response after its delivery
+    # attempt (cron/scheduler.py _run_one_job_body). Return values are ignored.
+    "cron_output_finalized",
     # Streaming observers (agent.plugin_stream_hooks), off the token path; payloads are immutable
     # normalized text/lifecycle and cannot transform the stream.
     "on_stream_start", "on_stream_delta", "on_stream_end", "on_interim_message",
