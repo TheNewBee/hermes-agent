@@ -550,6 +550,15 @@ _parallel_pool_max_workers: Optional[int] = None
 _running_job_ids: set = set()
 _running_fire_owners: dict[str, dict[object, tuple[Optional[str], Path]]] = {}
 _running_lock = threading.Lock()
+# ``run_job`` owns creation of the cron session and learns the final resolved
+# model. ``run_one_job`` owns persistence/delivery, so use context-local state
+# to carry only this terminal-artifact metadata across that boundary.
+_cron_run_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "cron_run_session_id", default=""
+)
+_cron_run_model: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "cron_run_model", default=""
+)
 
 # Wall-clock (time.time()) instant each in-flight job id was claimed by
 # ``_submit_with_guard``, plus the future that owns its release (a pending
@@ -3216,6 +3225,31 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     return None
 
 
+def _invoke_cron_output_finalized(
+    *,
+    response_text: str,
+    session_id: str,
+    model: str,
+    artifact_path: str,
+    delivery_state: str,
+) -> None:
+    """Notify observers only after cron has persisted its terminal artifact."""
+    try:
+        from hermes_cli.plugins import invoke_hook
+
+        invoke_hook(
+            "cron_output_finalized",
+            response_text=response_text,
+            session_id=session_id,
+            model=model,
+            platform="cron",
+            artifact_path=artifact_path,
+            delivery_state=delivery_state,
+        )
+    except Exception as exc:
+        logger.warning("cron_output_finalized hook failed: %s", exc)
+
+
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
 # Backward-compatible module override used by tests and emergency monkeypatches.
 _SCRIPT_TIMEOUT = _DEFAULT_SCRIPT_TIMEOUT
@@ -4926,6 +4960,7 @@ def run_job(
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
+    _cron_run_session_id.set(_cron_session_id)
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)
     logger.info("Prompt: %s", prompt[:100])
@@ -5757,6 +5792,7 @@ def run_job(
             )
 
         final_response = result.get("final_response", "") or ""
+        _cron_run_model.set(str(result.get("model") or getattr(agent, "model", "") or ""))
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
@@ -6171,6 +6207,12 @@ def run_one_job(
             fire_owner or None,
             profile_home,
         )
+    # Terminal-artifact metadata crosses the run_job → persistence boundary via
+    # context-local state. Each invocation starts from a clean slate so a stale
+    # session id from a previous job (or a direct unit-test call) cannot leak
+    # into this run's finalization.
+    session_token = _cron_run_session_id.set("")
+    model_token = _cron_run_model.set("")
     try:
         return _run_with_fire_claim_heartbeat(
             job,
@@ -6189,6 +6231,8 @@ def run_one_job(
             ),
         )
     finally:
+        _cron_run_model.reset(model_token)
+        _cron_run_session_id.reset(session_token)
         with _running_lock:
             executions = _running_fire_owners.get(job["id"])
             if executions is not None:
@@ -6545,6 +6589,30 @@ def _run_one_job_body(
                 error="Interrupted by gateway shutdown before terminal completion.",
             )
             return True
+
+        # Notify the terminal-artifact observer (continuation-ledger validator)
+        # only after persistence and the delivery attempt, before the run is
+        # marked. Shadow-only: return values are ignored and nothing here
+        # alters delivery semantics.
+        session_id = _cron_run_session_id.get()
+        if success and session_id:
+            if should_deliver:
+                # ``_deliver_result`` returns None for both successful remote
+                # sends and intentional local-only routing. The durable fact at
+                # this seam is a completed attempt after persistence; do not
+                # overclaim a remote delivery receipt.
+                delivery_state = (
+                    "DELIVERY_ATTEMPTED" if delivery_error is None else "DELIVERY_FAILED"
+                )
+            else:
+                delivery_state = "PERSISTED_ONLY"
+            _invoke_cron_output_finalized(
+                response_text=final_response,
+                session_id=session_id,
+                model=_cron_run_model.get(),
+                artifact_path=str(output_file),
+                delivery_state=delivery_state,
+            )
 
         mark_kwargs = {"delivery_error": delivery_error}
         if fire_owner is not None:

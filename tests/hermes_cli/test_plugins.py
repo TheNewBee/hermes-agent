@@ -743,6 +743,11 @@ class TestPluginLoading:
 class TestPluginHooks:
     """Tests for lifecycle hook registration and invocation."""
 
+    def test_cron_output_finalized_is_a_registered_hook(self):
+        """cron_output_finalized must be a registered VALID_HOOKS observer so
+        the scheduler's terminal-artifact finalization can dispatch it (and
+        shell-hook approval allows it)."""
+        assert "cron_output_finalized" in VALID_HOOKS
 
 
     def test_pre_gateway_dispatch_collects_action_dicts(self, tmp_path, monkeypatch):

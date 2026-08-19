@@ -78,6 +78,67 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert calls[-1] == ("mark", "j2", True)
 
 
+def test_run_one_job_finalizes_persisted_terminal_artifact_after_delivery(monkeypatch):
+    """A successful run invokes the terminal-artifact observer (finalize)
+    after save+deliver and before mark, carrying the persisted artifact
+    metadata captured across the run_job boundary via context-local state."""
+    calls = _patch_pipeline(monkeypatch)
+    finalized = []
+
+    def fake_run_job(job, *, defer_agent_teardown=None, **kw):
+        calls.append(("run_job", job["id"]))
+        s._cron_run_session_id.set("cron_j2_20260720_090000")
+        return True, "out", "final response", None
+
+    def fake_finalize(**kwargs):
+        calls.append(("finalize", kwargs["session_id"]))
+        finalized.append(kwargs)
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(s, "_invoke_cron_output_finalized", fake_finalize)
+
+    assert s.run_one_job({"id": "j2", "name": "t"}) is True
+    assert [call[0] for call in calls] == [
+        "run_job", "save", "deliver", "finalize", "mark"
+    ]
+    assert finalized == [{
+        "response_text": "final response",
+        "session_id": "cron_j2_20260720_090000",
+        "model": "",
+        "artifact_path": "/tmp/j2.txt",
+        "delivery_state": "DELIVERY_ATTEMPTED",
+    }]
+
+
+def test_run_one_job_stale_session_id_does_not_finalize(monkeypatch):
+    """A leftover session id in the shared context must NOT trigger
+    finalization for a run whose run_job did not establish a fresh session
+    (e.g. the early SILENT/no-output return before the session is created)."""
+    calls = _patch_pipeline(monkeypatch)
+    finalized = []
+
+    stale_token = s._cron_run_session_id.set("stale_session_from_previous_job")
+
+    def fake_run_job(job, *, defer_agent_teardown=None, **kw):
+        calls.append(("run_job", job["id"]))
+        # Deliberately do NOT set _cron_run_session_id (early-path shape).
+        return True, "out", "final response", None
+
+    monkeypatch.setattr(s, "run_job", fake_run_job)
+    monkeypatch.setattr(
+        s, "_invoke_cron_output_finalized",
+        lambda **kw: finalized.append(kw),
+    )
+
+    try:
+        assert s.run_one_job({"id": "j2", "name": "t"}) is True
+    finally:
+        s._cron_run_session_id.reset(stale_token)
+
+    assert finalized == []
+    assert [call[0] for call in calls] == ["run_job", "save", "deliver", "mark"]
+
+
 def test_run_one_job_exception_delivers_failure_alert(monkeypatch):
     """An exception escaping the run body must not become a silent error row."""
     delivered = []
