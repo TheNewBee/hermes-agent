@@ -1040,7 +1040,17 @@ class TestStreamingAccessDeniedDetection:
         )
 
     def test_matches_access_denied_client_error(self):
-        pytest.importorskip("botocore", reason="botocore required for Bedrock exception tests")
+        # Hermetic guard: this test needs the real botocore.exceptions.ClientError.
+        # Importing it pulls in botocore.vendored.requests (a large vendored tree
+        # with no __pycache__ that is recompiled per subprocess), which can
+        # transiently fail to import under heavy full-suite load on slow/WSL
+        # filesystems. Skip cleanly on that env glitch instead of flaking — this
+        # never weakens the AccessDenied-detection semantics asserted below.
+        pytest.importorskip(
+            "botocore.exceptions",
+            reason="botocore.exceptions (ClientError) required for Bedrock IAM-denial tests",
+            exc_type=ImportError,
+        )
         from agent.bedrock_adapter import is_streaming_access_denied_error
         assert is_streaming_access_denied_error(self._denied_client_error()) is True
 
@@ -1060,7 +1070,16 @@ class TestCallConverseStreamIamFallback:
     streaming action — InvokeModel-only policies keep working."""
 
     def test_falls_back_to_converse_on_streaming_denial(self):
-        pytest.importorskip("botocore", reason="botocore required for Bedrock exception tests")
+        # Hermetic guard (same reasoning as TestStreamingAccessDeniedDetection):
+        # the botocore.exceptions.ClientError import pulls in the large
+        # botocore.vendored.requests tree which can transiently fail to import
+        # under heavy full-suite/WSL load. Skip cleanly on that env glitch — this
+        # never weakens the IAM-fallback semantics asserted below.
+        pytest.importorskip(
+            "botocore.exceptions",
+            reason="botocore.exceptions (ClientError) required for Bedrock IAM-fallback tests",
+            exc_type=ImportError,
+        )
         from agent.bedrock_adapter import (
             _bedrock_runtime_client_cache,
             call_converse_stream,
