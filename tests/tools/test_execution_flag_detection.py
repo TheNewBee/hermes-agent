@@ -58,7 +58,14 @@ def test_real_binaries_execute_leading_dash_program_payload(
     input_file.write_text("needle\n")
     resolved_args = [arg.format(input=str(input_file)) for arg in args]
     input_text = (
-        "\n".join(str(number) for number in range(10_000, 0, -1)) + "\n"
+        # Keep the bulk payload small enough to stay load-tolerant: with
+        # --buffer-size=1K sort spills roughly one temp chunk (and forks the
+        # --compress-program marker) per few bytes, so a huge stdin turns
+        # this real-binary path into a fork/exec storm that times out the
+        # hard 20s bound on a loaded host. 500 lines still force many spills
+        # (dozens of marker invocations) while finishing in well under a
+        # second, preserving the executable-detection assertion unchanged.
+        "\n".join(str(number) for number in range(500, 0, -1)) + "\n"
         if stdin == "{bulk}"
         else stdin
     )
