@@ -190,6 +190,20 @@ async def test_full_dispatch_rejects_lease_timeout_without_running_goal_hook(
     monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "5")
     monkeypatch.setenv("HERMES_TURN_LEASE_TIMEOUT", "0.02")
 
+    # Hermetic guard: full dispatch routes several pure helpers (Telegram
+    # topic recovery, topic-lane detection, binding writes) through
+    # asyncio.to_thread before the turn lease is reached. That thread hop is
+    # wall-clock-indeterminate under full-suite load and once blew this test's
+    # wait_for(1s) budget at the first to_thread without ever exercising the
+    # lease logic. Every function dispatched through to_thread on this path is
+    # pure (returns None/False or touches mocks), so running it inline is
+    # semantically identical while removing the thread-scheduling flake.
+    # Production dispatch is unchanged; only this test's environment is pinned.
+    async def _inline_thread_hop(__func, *args, **kwargs):
+        return __func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", _inline_thread_hop)
+
     runner.session_store.load_transcript.side_effect = AssertionError(
         "transcript must not load after a turn-lease timeout"
     )
