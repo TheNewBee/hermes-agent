@@ -3454,6 +3454,15 @@ class TestFTSExternalContentMigration:
                 "CREATE TABLE fts_v22_trash_messages_fts_data "
                 "(docid INTEGER PRIMARY KEY, block BLOB)"
             )
+            # One transaction for the bulk seed: the SessionDB connection
+            # is in autocommit (isolation_level=None), so an implicit commit
+            # per row means an fsync per row. On this filesystem 2500 rows
+            # took ~22s of pure seeding — dead time that did not exist in
+            # teardown under test. Batching the seed into a single write
+            # preserves every assertion below while keeping the test within
+            # the bounded time budget (see the same pattern in
+            # TestGetMessagesPagination._seed via append_messages_batch).
+            conn.execute("BEGIN")
             conn.executemany(
                 "INSERT INTO fts_v22_trash_messages_fts_data "
                 "(docid, block) VALUES (?, ?)",
@@ -3490,6 +3499,11 @@ class TestFTSExternalContentMigration:
                 "CREATE TABLE fts_v22_trash_messages_fts_data "
                 "(docid INTEGER PRIMARY KEY, block BLOB)"
             )
+            # Single-transaction seed — see the sibling teardown test above
+            # for why per-row autocommit inserts on this connection cost
+            # ~22s of dead time for a fixture that exercises teardown, not
+            # row-by-row seeding durability.
+            conn.execute("BEGIN")
             conn.executemany(
                 "INSERT INTO fts_v22_trash_messages_fts_data "
                 "(docid, block) VALUES (?, ?)",
