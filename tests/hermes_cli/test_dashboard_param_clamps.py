@@ -13,6 +13,7 @@ import pytest
 
 fastapi = pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 
 @pytest.fixture()
@@ -20,6 +21,27 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_DASHBOARD_SESSION_TOKEN", "clamp-test-token")
     from hermes_cli import web_server
+    import hermes_state
+
+    # Hermetic guard: the dashboard resolves both its session-store path and
+    # its auth token at MODULE IMPORT time — hermes_state.DEFAULT_DB_PATH on
+    # line 348 and web_server._SESSION_TOKEN on line 478. In a full-suite
+    # pytest process those globals are frozen to an EARLIER file's values
+    # before this fixture runs: test_dashboard_admin_endpoints.py re-points
+    # DEFAULT_DB_PATH directly (and never restores it), and whatever test
+    # imports web_server first captures that file's HERMES_DASHBOARD_SESSION_TOKEN
+    # (or a freshly-minted token when the var is unset). Setting HERMES_HOME
+    # and the token env above is therefore NOT sufficient in isolation: the
+    # analytics/session handlers under test would open a stale DB path
+    # (intermittent 500 under full-suite load) or reject the Bearer header the
+    # fixture sends (401). Re-pin both module globals to this test's isolated
+    # values for the test's lifetime; monkeypatch restores them afterwards.
+    # Production resolution is unchanged — only this test's environment is
+    # pinned.
+    monkeypatch.setattr(
+        hermes_state, "DEFAULT_DB_PATH", str(Path(tmp_path) / "state.db")
+    )
+    monkeypatch.setattr(web_server, "_SESSION_TOKEN", "clamp-test-token")
 
     with TestClient(web_server.app, raise_server_exceptions=False) as c:
         c.headers["Authorization"] = "Bearer clamp-test-token"
