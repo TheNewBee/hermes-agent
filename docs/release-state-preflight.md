@@ -1,7 +1,7 @@
 # Release-state preflight: mutable-checkout / temporary-launcher contamination
 
 **Driver ticket:** `t_7269023e` (recurring mutable-live-checkout root cause)
-**Status:** prerequisite shipped in `9ceebf036c` (`feat(hermes_cli): add deterministic release-state preflight validator (t_7269023e)`); **not yet wired into any live gate** — see [Next step](#next-step-bounded-gate-consumption).
+**Status:** prerequisite shipped in `5d2a54d3a6` (`feat(hermes_cli): add deterministic release-state preflight validator (t_7269023e)`); **not yet wired into any live gate** — see [Next step](#next-step-bounded-gate-consumption).
 **Severity:** P2 — recurrent activation/launcher integrity failures; does not corrupt data but blocks safe activation and silently runs throwaway code paths.
 
 ## Summary
@@ -31,7 +31,7 @@ Fixture coverage: `tests/hermes_cli/test_release_preflight.py` (14 tests) — cl
 
 ## Next step (bounded gate consumption — approval-gated)
 
-The validator is deliberately **not** wired into any runtime path in `9ceebf036c`. The later, approval-gated lane should:
+The validator is deliberately **not** wired into any runtime path in `5d2a54d3a6`. The later, approval-gated lane should:
 
 1. Invoke, before any activation/cutover and with explicit durable paths:
    `python -m hermes_cli.release_preflight --root <durable root> --launcher <durable>/venv/bin/hermes --launcher <durable>/venv/bin/python`
