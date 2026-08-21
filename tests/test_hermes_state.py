@@ -820,10 +820,15 @@ class TestFTS5Search:
         db.append_message("s1", role="user", content="after")
 
         statements = []
-        read_conn = db._get_read_conn() or db._conn
+        # Trace the connection that _read_ctx will actually borrow from the
+        # bounded pool; _get_read_conn() opens a connection but does not return
+        # it to the pool, so tracing it directly both misses the query and leaks
+        # its permit for the life of the fixture.
+        read_conn = db._checkout_read_conn()
         traced_connections = [db._conn]
-        if read_conn is not db._conn:
+        if read_conn is not None:
             traced_connections.append(read_conn)
+            db._read_pool.put_nowait(read_conn)
         for conn in traced_connections:
             conn.set_trace_callback(statements.append)
 
