@@ -7918,14 +7918,31 @@ def tick(
                 verbose=verbose,
             )
 
-        # Partition due jobs: those with a per-job workdir mutate
-        # os.environ["TERMINAL_CWD"] inside run_job, which is process-global, so
-        # they queue on the single-thread sequential pool to run one at a time.
-        # That alone only keeps workdir jobs from overlapping EACH OTHER;
-        # run_job's _terminal_cwd_lock is what additionally stops a concurrently
-        # firing workdir-less parallel-pool job from observing the override.
-        sequential_jobs = [j for j in due_jobs if (j.get("workdir") or "").strip()]
-        parallel_jobs = [j for j in due_jobs if not (j.get("workdir") or "").strip()]
+        # Partition due jobs around the process-global TERMINAL_CWD override.
+        # A workdir agent is a writer; an agent without workdir is a reader.
+        # Starting both pools from the same due batch lets a long reader obtain
+        # the read lock first, then burn the writer's 660-second fail-closed
+        # wait before the writer can execute (#79768).  When a batch contains
+        # at least one writer, queue its agent readers behind the writers on
+        # the existing single-thread pool.  Script-only jobs use subprocess
+        # cwd and do not enter the reader lock, so they retain parallelism.
+        sequential_jobs = [
+            j for j in due_jobs if (j.get("workdir") or "").strip()
+        ]
+        reader_jobs = [
+            j
+            for j in due_jobs
+            if not (j.get("workdir") or "").strip() and not j.get("no_agent")
+        ]
+        parallel_jobs = [
+            j
+            for j in due_jobs
+            if not (j.get("workdir") or "").strip() and j.get("no_agent")
+        ]
+        if sequential_jobs:
+            sequential_jobs.extend(reader_jobs)
+        else:
+            parallel_jobs.extend(reader_jobs)
 
         _results: list = []
         _all_futures: list = []
