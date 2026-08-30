@@ -151,7 +151,7 @@ class TestTickWorkdirPartition:
         # Two workdir jobs (both sequential) + one parallel job.
         workdir_a = {"id": "a", "name": "A", "workdir": str(tmp_path)}
         workdir_b = {"id": "b", "name": "B", "workdir": str(tmp_path)}
-        parallel_job = {"id": "c", "name": "C", "workdir": None}
+        parallel_job = {"id": "c", "name": "C", "workdir": None, "no_agent": True}
 
         monkeypatch.setattr(sched, "get_due_jobs", lambda: [workdir_a, workdir_b, parallel_job])
         monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
@@ -191,6 +191,60 @@ class TestTickWorkdirPartition:
             assert workdir_thread_name.startswith("cron-seq"), workdir_thread_name
         par_thread_name = next(t for j, t in calls if j == "c")
         assert par_thread_name.startswith("cron-parallel"), par_thread_name
+
+    def test_agent_reader_waits_for_due_workdir_batch(self, tmp_path, monkeypatch):
+        """A same-tick agent reader cannot consume a writer's cwd lock budget.
+
+        ``TERMINAL_CWD`` is process-global.  If a batch includes a workdir
+        writer, a workdir-less *agent* must not begin until that writer's
+        serialized batch has finished; otherwise a long reader can make the
+        writer time out fail-closed before it ever gets to run.  Script-only
+        jobs do not enter ``run_job``'s reader lock and retain the parallel
+        pool.
+        """
+        import threading
+        import time
+
+        import cron.scheduler as sched
+
+        sched._parallel_pool = None
+        sched._parallel_pool_max_workers = None
+        sched._sequential_pool = None
+        sched._running_job_ids.clear()
+
+        writer = {"id": "writer", "name": "writer", "workdir": str(tmp_path)}
+        reader = {"id": "reader", "name": "reader", "workdir": None}
+        script = {"id": "script", "name": "script", "workdir": None, "no_agent": True}
+        monkeypatch.setattr(sched, "get_due_jobs", lambda: [writer, reader, script])
+        monkeypatch.setattr(sched, "claim_job_for_fire", lambda *_a, **_kw: True)
+        monkeypatch.setattr(sched, "save_job_output", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "mark_job_run", lambda *_a, **_kw: None)
+        monkeypatch.setattr(sched, "_deliver_result", lambda *_a, **_kw: None)
+
+        writer_started = threading.Event()
+        writer_finished = threading.Event()
+        reader_saw_finished: list[bool] = []
+        thread_names: dict[str, str] = {}
+
+        def fake_run_job(job, **_kw):
+            thread_names[job["id"]] = threading.current_thread().name
+            if job["id"] == "writer":
+                writer_started.set()
+                time.sleep(0.15)
+                writer_finished.set()
+            elif job["id"] == "reader":
+                assert writer_started.wait(timeout=1)
+                reader_saw_finished.append(writer_finished.is_set())
+            return True, "output", "response", None
+
+        monkeypatch.setattr(sched, "run_job", fake_run_job)
+
+        assert sched.tick(verbose=False) == 3
+        assert reader_saw_finished == [True]
+        assert thread_names["reader"].startswith("cron-seq")
+        assert thread_names["script"].startswith("cron-parallel")
+
+        sched._shutdown_parallel_pool()
 
 
 # ---------------------------------------------------------------------------
