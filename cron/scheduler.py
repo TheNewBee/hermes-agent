@@ -543,6 +543,20 @@ def _cron_failure_marker_error(text: str) -> Optional[str]:
     return evidence or "Cron agent reported failure."
 
 
+# Persisted record for an agent-declared failure: one bounded evidence line, not the report.
+AGENT_DECLARED_RECORD_PREFIX = "agent_declared_failure:"
+_AGENT_DECLARED_RECORD_MAX_CHARS = 200
+
+
+def _agent_declared_failure_record(evidence: Optional[str]) -> str:
+    """``last_error`` / ledger ``error`` for an agent-declared failure: the first non-empty evidence
+    line behind a fixed prefix, capped at 200 characters. The full report stays in the saved run
+    output and the delivered notice; raised exceptions keep their ``Class: message`` record."""
+    first = next((line.strip() for line in (evidence or "").splitlines() if line.strip()), "")
+    text = f"{AGENT_DECLARED_RECORD_PREFIX} {first or 'Cron agent reported failure.'}"
+    return text[:_AGENT_DECLARED_RECORD_MAX_CHARS]
+
+
 def _is_cron_silence_response(text: str) -> bool:
     """True when a cron final response should suppress delivery: ``[SILENT]`` (or SILENT /
     NO_REPLY / NO REPLY) as the whole response OR its own first/last line — NOT mid-sentence.
@@ -3157,6 +3171,10 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         from cron.jobs import update_job
         update_job(job["id"], {"last_delivery_queued": None})
         job["last_delivery_queued"] = None
+    # The persisted record (jobs.json last_error/last_failure, ledger error) for an agent-declared
+    # failure is one bounded evidence line. The full report stays in the saved output and notice.
+    record_error = (
+        _agent_declared_failure_record(d.error) if d.agent_declared and not d.success else d.error)
     mark_kwargs: dict = {"delivery_error": d.delivery_error}
     if not d.success and job.pop("_model_unreachable", False):
         # Never-reached-the-model failure: schedule the Cowork-style bounded re-run
@@ -3179,7 +3197,7 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         mark_kwargs["status"] = "blocked_config"
     # A run that removed its own record has nothing left to mark; the delivery above is its result.
     marked = self_removal_delivery_allowed(job["id"]) or mark_job_run(
-        job["id"], d.success, d.error, **mark_kwargs)
+        job["id"], d.success, record_error, **mark_kwargs)
     if fire_owner is not None and not marked:
         finish_execution(
             execution_id, success=False,
@@ -3200,7 +3218,7 @@ def _finish_completed_run(d: _RunDelivery, fire_owner: Optional[str], execution_
         # Failure ping left the process (or had a configured target): mark the incident alerted.
         _mark_incident_alerted(d.failure_incident_id)
     finish_execution(
-        execution_id, success=d.success, error=d.error, delivery_outcome=delivery_outcome)
+        execution_id, success=d.success, error=record_error, delivery_outcome=delivery_outcome)
     return True
 
 
