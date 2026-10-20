@@ -556,6 +556,20 @@ def _cron_failure_marker_error(text: str) -> Optional[str]:
     return evidence or "Cron agent reported failure."
 
 
+# Persisted record for an agent-declared failure: one bounded evidence line, not the report.
+AGENT_DECLARED_RECORD_PREFIX = "agent_declared_failure:"
+_AGENT_DECLARED_RECORD_MAX_CHARS = 200
+
+
+def _agent_declared_failure_record(evidence: Optional[str]) -> str:
+    """``last_error`` / ledger ``error`` for an agent-declared failure: the first non-empty evidence
+    line behind a fixed prefix, capped at 200 characters. The full report stays in the saved run
+    output and the delivered notice; raised exceptions keep their ``Class: message`` record."""
+    first = next((line.strip() for line in (evidence or "").splitlines() if line.strip()), "")
+    text = f"{AGENT_DECLARED_RECORD_PREFIX} {first or 'Cron agent reported failure.'}"
+    return text[:_AGENT_DECLARED_RECORD_MAX_CHARS]
+
+
 def _is_cron_silence_response(text: str) -> bool:
     """True when a cron final response should suppress delivery: ``[SILENT]`` (or SILENT /
     NO_REPLY / NO REPLY) as the whole response OR its own first/last line — NOT mid-sentence.
