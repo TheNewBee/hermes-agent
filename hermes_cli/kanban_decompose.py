@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
 from dataclasses import dataclass
 from typing import Optional
 
@@ -153,6 +154,65 @@ def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = 
         return "default"
 
 
+_ROUTE_FAILURE_MARKERS = (
+    "rate-limited", "auth failed", "exhausted", "expired", "FreeTierError",
+    "(403)", "(429)", "(401)", "no credential",
+)
+_AUTH_PROVIDER_HEADER = re.compile(r"^([A-Za-z0-9_.-]+) \(\d+ credentials?\):\s*$")
+_AUTH_CREDENTIAL_LINE = re.compile(r"^\s+#\d+\s")
+_DEFAULT_PROFILE_NAME = "default"
+
+
+def _usable_providers_from_auth_text(text: str) -> set[str]:
+    """Providers with at least one ``hermes auth list`` credential lacking a failure marker."""
+    usable: set[str] = set()
+    current: Optional[str] = None
+    for line in text.splitlines():
+        header = _AUTH_PROVIDER_HEADER.match(line.strip())
+        if header:
+            current = header.group(1)
+            continue
+        if (current is not None and _AUTH_CREDENTIAL_LINE.match(line)
+                and not any(marker in line for marker in _ROUTE_FAILURE_MARKERS)):
+            usable.add(current)
+    return usable
+
+
+def _usable_route_providers() -> Optional[set[str]]:
+    """Providers with a usable credential, or None when ``hermes auth list`` is unreadable."""
+    try:
+        completed = subprocess.run(
+            ["hermes", "auth", "list"], capture_output=True, text=True, timeout=60, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = completed.stdout or ""
+    return _usable_providers_from_auth_text(text) if text.strip() else None
+
+
+def _profiles_with_usable_routes(profiles, usable: Optional[set[str]]) -> list:
+    """Drop profiles whose primary provider has no usable credential, so the decomposer cannot assign them.
+
+    The default profile always stays as the fallback assignee. A profile with no resolvable provider
+    stays, and the watchdog's dead-route audit reports it. When auth is unreadable the roster is left
+    unchanged, so a transient auth-probe failure cannot empty routing.
+    """
+    if usable is None:
+        logger.warning("decompose: auth list unreadable; roster not filtered by route health")
+        return list(profiles)
+    kept = []
+    for profile in profiles:
+        provider = getattr(profile, "provider", None)
+        if profile.name != _DEFAULT_PROFILE_NAME and provider and provider not in usable:
+            logger.warning(
+                "decompose: excluding profile %s (provider %s has no usable credential)",
+                profile.name, provider,
+            )
+            continue
+        kept.append(profile)
+    return kept
+
+
 def _build_roster() -> tuple[list[dict], set[str]]:
     """``(roster_for_prompt, valid_assignee_names)``; entries are
     ``{name, description, has_description}``."""
@@ -161,6 +221,7 @@ def _build_roster() -> tuple[list[dict], set[str]]:
     except Exception as exc:
         logger.warning("decompose: failed to list profiles: %s", exc)
         return [], set()
+    all_profiles = _profiles_with_usable_routes(all_profiles, _usable_route_providers())
     roster = []
     for p in all_profiles:
         desc = (p.description or "").strip()
