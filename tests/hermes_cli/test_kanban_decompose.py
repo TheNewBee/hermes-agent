@@ -24,6 +24,8 @@ def kanban_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Roster route filtering shells out to `hermes auth list`; keep these tests off the real CLI.
+    monkeypatch.setattr(decomp, "_usable_route_providers", lambda: None)
     kb.init_db()
     return home
 
