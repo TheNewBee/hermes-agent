@@ -126,3 +126,16 @@ def test_wait_is_sliced_and_touches_activity(clock):
     assert _check(agent) is False
     assert clock.slept and max(clock.slept) <= 30.0
     assert agent._touches, "waiting must touch activity so the cron inactivity watchdog stays quiet"
+
+
+def test_user_interrupt_ends_the_wait_early(clock):
+    agent = _agent(FakePool(clock, [clock.now + 600]))
+    sleep = clock.sleep
+
+    def sleep_then_interrupt(seconds):
+        sleep(seconds)
+        agent._interrupt_requested = True
+
+    clock.sleep = sleep_then_interrupt
+    assert _check(agent) is True  # interrupted: skip, do not activate the candidate
+    assert sum(clock.slept) < 5, "/stop must not wait out the whole cap"

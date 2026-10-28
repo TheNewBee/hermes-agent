@@ -1957,6 +1957,7 @@ def _fallback_chain_exhausted(agent, reason: FailoverReason | None) -> bool:
 
 _FALLBACK_POOL_WAIT_CAP_S = 600.0  # default for fallback.max_pool_wait_seconds (0 disables waiting)
 _FALLBACK_POOL_WAIT_SLICE_S = 30.0  # activity is touched between slices so the cron watchdog sees progress
+_FALLBACK_POOL_WAIT_TICK_S = 0.5  # interrupt latency while waiting (/stop, new message)
 
 
 def _fallback_pool_wait_cap() -> float:
@@ -1968,12 +1969,19 @@ def _fallback_pool_wait_cap() -> float:
         return _FALLBACK_POOL_WAIT_CAP_S
 
 
-def _sleep_until(agent, until: float) -> None:
+def _sleep_until(agent, until: float) -> bool:
+    """Wait for ``until``; False as soon as the user interrupts (/stop or a new message)."""
+    touched = time.time()
     while (left := until - time.time()) > 0:
-        time.sleep(min(left, _FALLBACK_POOL_WAIT_SLICE_S))
-        touch = getattr(agent, "_touch_activity", None)
-        if callable(touch):
-            touch("waiting for fallback credential cooldown")
+        if getattr(agent, "_interrupt_requested", False):
+            return False
+        time.sleep(min(left, _FALLBACK_POOL_WAIT_TICK_S))
+        if time.time() - touched >= _FALLBACK_POOL_WAIT_SLICE_S:
+            touch = getattr(agent, "_touch_activity", None)
+            if callable(touch):
+                touch("waiting for fallback credential cooldown")
+            touched = time.time()
+    return True
 
 
 def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
@@ -2005,7 +2013,8 @@ def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
         return True
     logger.info("Fallback %s/%s: every credential cooling; waiting %.0f s for the earliest to reopen",
                 fb_provider, fb_model, max(0.0, wait))
-    _sleep_until(agent, until)
+    if not _sleep_until(agent, until):
+        return True  # user interrupted the wait: skip rather than activate
     return not pool.has_available(model=fb_model)
 
 

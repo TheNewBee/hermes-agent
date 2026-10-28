@@ -154,6 +154,7 @@ class TestFallbackCredentialIsolation:
 
         def _wait_out_throttle(_agent, until):
             reopened["open"] = True
+            return True  # not interrupted: the wait completed
 
         with patch("agent.auxiliary_client.resolve_provider_client", return_value=(client, "m")) as resolve, \
                 patch("agent.credential_pool.load_pool", side_effect=lambda p: pools[p]), \
