@@ -2570,6 +2570,7 @@ def run_job(
 
     agent = None
     model = ""
+    setup: Optional[_CronAgentSetup] = None
     _session_db = None
     _audit: Optional[_FireAudit] = None
     _worker_state: dict = {}
@@ -2631,8 +2632,9 @@ def run_job(
                 job["_model_unreachable"] = True
             # Provider usage window closed for a known duration (cron/quota_hold.py): flag it so the
             # bookkeeping tail parks the job past the window instead of re-firing into it (#89376).
-            from cron.quota_hold import hold_seconds_from_failure
-            _hold_s = hold_seconds_from_failure(e)
+            from cron.quota_hold import hold_seconds_from_failure, hold_seconds_from_pool_reset
+            _hold_s = hold_seconds_from_failure(e) or hold_seconds_from_pool_reset(
+                e, getattr(setup, "credential_pool", None), model)
             if _hold_s:
                 job["_quota_hold_seconds"] = _hold_s
         except Exception:  # classification must never mask the real failure

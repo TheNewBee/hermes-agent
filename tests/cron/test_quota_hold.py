@@ -171,3 +171,131 @@ def test_quota_hold_parks_past_window_survives_stale_rearm_and_clears_on_model_r
     j = update_job(job_id, {"schedule": "every 15m"})
     assert qh.STATE_KEY not in j
     assert datetime.fromisoformat(j["next_run_at"]) - now < timedelta(hours=1)
+
+
+# --- Plain provider 429 (agent exhausted its retries; no AuthError, no retry-after hint) -----
+# The reset comes from the job's primary credential pool instead (2026-10-27: Anthropic pool
+# reopened 8627s after a 13:36 PT failure).
+
+HTTP_429_MSG = ("API call failed after 3 retries. HTTP 429: This request would exceed your "
+                "account's rate limit. Please try again later. | provider=anthropic "
+                "model=claude-haiku-5-5")
+TUE_1336_PT = datetime(2026, 10, 27, 20, 36, tzinfo=UTC)
+
+
+class _FakePool:
+    def __init__(self, reset_at):
+        self.reset_at, self.models = reset_at, []
+
+    def next_available_at(self, *, model=None):
+        self.models.append(model)
+        return self.reset_at
+
+
+def _frozen(monkeypatch, now):
+    monkeypatch.setattr("cron.jobs._hermes_now", lambda: now)
+    monkeypatch.setattr(qh, "_hermes_now", lambda: now)
+
+
+def test_pool_reset_hold_only_for_plain_429_with_future_pool_reset(monkeypatch):
+    """(c)(d): text alone never parks (the pool must also report a future reset); an AuthError
+    in the chain belongs to the AuthError path; no reset / a past reset means no hold."""
+    now = TUE_1336_PT
+    _frozen(monkeypatch, now)
+    pool = _FakePool(now.timestamp() + 8627)
+
+    assert qh.hold_seconds_from_pool_reset(RuntimeError(HTTP_429_MSG), pool, "claude-haiku-5-5") \
+        == 8627 + qh.POOL_RESET_SLACK_SECONDS - qh.HOLD_SLACK_SECONDS
+    assert pool.models == ["claude-haiku-5-5"]
+    try:
+        raise RuntimeError("agent reported failure") from RuntimeError("Rate limit reached")
+    except RuntimeError as wrapped:
+        assert qh.hold_seconds_from_pool_reset(wrapped, pool, "m")
+    # (c) no 429 text
+    assert qh.hold_seconds_from_pool_reset(RuntimeError("model said no"), pool, "m") is None
+    # AuthError path untouched: a 429-looking AuthError in the chain is not ours to classify
+    try:
+        raise RuntimeError(HTTP_429_MSG) from AuthError("expired", code="expired")
+    except RuntimeError as wrapped:
+        assert qh.hold_seconds_from_pool_reset(wrapped, pool, "m") is None
+    # (d) no usable reset
+    assert qh.hold_seconds_from_pool_reset(RuntimeError(HTTP_429_MSG), _FakePool(None), "m") is None
+    assert qh.hold_seconds_from_pool_reset(
+        RuntimeError(HTTP_429_MSG), _FakePool(now.timestamp() - 5), "m") is None
+    assert qh.hold_seconds_from_pool_reset(RuntimeError(HTTP_429_MSG), None, "m") is None
+
+
+def test_plain_429_retries_same_day_at_pool_reset_then_success_clears(tmp_cron_home, monkeypatch):
+    """(a)(e): reset+300s lands before tomorrow's natural fire -> one-off retry at reset+300s,
+    marker set, cron expression untouched; a later successful run clears the marker."""
+    now = TUE_1336_PT
+    _frozen(monkeypatch, now)
+    job = create_job("paper portfolio review", "15 20 * * 1-5")
+    natural_next = datetime(2026, 10, 28, 20, 15, tzinfo=UTC)
+    assert datetime.fromisoformat(job["next_run_at"]) == natural_next
+
+    hold_s = qh.hold_seconds_from_pool_reset(
+        RuntimeError(HTTP_429_MSG), _FakePool(now.timestamp() + 8627), "claude-haiku-5-5")
+    assert mark_job_run(job["id"], False, HTTP_429_MSG, quota_hold_seconds=hold_s,
+                        recover_consumed_fire=True)
+
+    held = get_job(job["id"])
+    assert datetime.fromisoformat(held["next_run_at"]) == now + timedelta(seconds=8627 + 300)
+    assert held[qh.STATE_KEY] == held["next_run_at"]
+    assert held["schedule"]["expr"] == "15 20 * * 1-5"
+    assert qh.is_recovery_fire(held, held["next_run_at"])
+
+    assert mark_job_run(job["id"], True)
+    done = get_job(job["id"])
+    assert qh.STATE_KEY not in done and qh.SCHEDULE_EXPR_KEY not in done
+    assert datetime.fromisoformat(done["next_run_at"]) == natural_next
+
+
+def test_plain_429_reset_after_natural_fire_parks_on_lattice(tmp_cron_home, monkeypatch):
+    """(b): the 21:00 fire falls inside the closed window -> existing behaviour (first legal
+    occurrence after the window), no off-lattice one-off."""
+    now = TUE_1336_PT
+    _frozen(monkeypatch, now)
+    job = create_job("evening scan", "0 21 * * *")
+    hold_s = qh.hold_seconds_from_pool_reset(
+        RuntimeError(HTTP_429_MSG), _FakePool(now.timestamp() + 8627), "m")
+    assert mark_job_run(job["id"], False, HTTP_429_MSG, quota_hold_seconds=hold_s,
+                        recover_consumed_fire=True)
+
+    held = get_job(job["id"])
+    assert datetime.fromisoformat(held["next_run_at"]) == datetime(2026, 10, 28, 21, 0, tzinfo=UTC)
+    assert qh.SCHEDULE_EXPR_KEY not in held
+    assert not qh.is_recovery_fire(held, held["next_run_at"])
+
+
+def test_scheduler_tick_parks_plain_429_using_job_primary_pool(tmp_cron_home):
+    """Wiring: run_one_job feeds the run's primary pool + resolved model into the hold."""
+    import time
+
+    job = create_job("portfolio triage", "every 30m", deliver="local", model="claude-haiku-5-5")
+    pool = _FakePool(time.time() + 8627)
+    deliveries: list = []
+    runtime = {"provider": "anthropic", "api_key": "fake", "base_url": "https://example.invalid",
+               "api_mode": "anthropic_messages"}
+    with patch.object(sched, "_load_credential_pool", return_value=pool):
+        with patch("run_agent.AIAgent") as agent_cls:
+            agent_cls.return_value.run_conversation.return_value = {
+                "failed": True, "completed": False, "error": HTTP_429_MSG, "final_response": ""}
+            with patch("cron.scheduler._hermes_home", tmp_cron_home), \
+                 patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
+                 patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+                 patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+                 patch("hermes_state_registry.acquire", return_value=MagicMock()), \
+                 patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]), \
+                 patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                       return_value=dict(runtime)), \
+                 patch.object(sched, "_deliver_result",
+                              side_effect=lambda jb, content, **kw: deliveries.append(content)):
+                sched.run_one_job(dict(get_job(job["id"])))
+
+    j = get_job(job["id"])
+    assert j["last_status"] == "error"
+    assert pool.models == ["claude-haiku-5-5"]
+    parked_in = datetime.fromisoformat(j["next_run_at"]).timestamp() - time.time()
+    assert 8627 + 300 - 30 < parked_in <= 8627 + 300
+    assert j[qh.STATE_KEY] == j["next_run_at"]

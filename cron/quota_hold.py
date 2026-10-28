@@ -56,6 +56,32 @@ def hold_seconds_from_failure(exc: BaseException) -> Optional[float]:
     return None
 
 
+# A plain provider 429 (agent exhausted its retries: RuntimeError text, no AuthError, no hint)
+# takes its reset from the run's primary credential pool and retries this far past it.
+POOL_RESET_SLACK_SECONDS = 300
+_RATE_LIMIT_TEXT_RE = re.compile(r"HTTP 429|rate limit", re.IGNORECASE)
+
+
+def hold_seconds_from_pool_reset(exc: BaseException, pool: Any, model: Optional[str]) -> Optional[float]:
+    """Hold seconds for a plain 429 failure, as ``plan_hold`` input (it adds HOLD_SLACK_SECONDS),
+    landing POOL_RESET_SLACK_SECONDS past the pool's reset. None when the chain carries an
+    AuthError (``hold_seconds_from_failure`` owns those), has no 429 text, or the pool reports
+    no future reset — text alone never parks a job."""
+    from hermes_cli.auth import AuthError
+
+    chain: list[BaseException] = []
+    cur: Optional[BaseException] = exc
+    while cur is not None and cur not in chain:
+        chain.append(cur)
+        cur = cur.__cause__ or cur.__context__
+    if (pool is None or any(isinstance(e, AuthError) for e in chain)
+            or not any(_RATE_LIMIT_TEXT_RE.search(str(e)) for e in chain)):
+        return None
+    reset_at = pool.next_available_at(model=model or None)
+    wait = float(reset_at) - _hermes_now().timestamp() if reset_at else 0.0
+    return wait + POOL_RESET_SLACK_SECONDS - HOLD_SLACK_SECONDS if wait > 0 else None
+
+
 def hold_active(job: dict[str, Any], now: Optional[datetime] = None) -> bool:
     """True while the job is parked inside a provider window (an expired marker is inert)."""
     from cron.jobs import _instant_after, _parse_aware  # late: jobs imports this module's helpers
