@@ -144,16 +144,23 @@ class TestFallbackCredentialIsolation:
         benched = _make_pool("openai-codex")
         benched.has_available.return_value = False
         benched.next_available_at.return_value = time.time() + 30995
+        # A 30 s throttle is waited out (not skipped): the mock pool reopens during that wait.
+        reopened = {"open": False}
         throttled = _make_pool("openrouter")
-        throttled.has_available.return_value = False
+        throttled.has_available.side_effect = lambda **_: reopened["open"]
         throttled.next_available_at.return_value = time.time() + 30
         pools = {"openai-codex": benched, "openrouter": throttled}
         client = SimpleNamespace(api_key="k", base_url="https://openrouter.ai/api/v1", _custom_headers={})
 
+        def _wait_out_throttle(_agent, until):
+            reopened["open"] = True
+
         with patch("agent.auxiliary_client.resolve_provider_client", return_value=(client, "m")) as resolve, \
-                patch("agent.credential_pool.load_pool", side_effect=lambda p: pools[p]):
+                patch("agent.credential_pool.load_pool", side_effect=lambda p: pools[p]), \
+                patch("agent.chat_completion_helpers._sleep_until", side_effect=_wait_out_throttle) as slept:
             assert try_activate_fallback(agent) is True
 
+        slept.assert_called_once()
         assert resolve.call_count == 1 and resolve.call_args.args[0] == "openrouter"
         assert agent.provider == "openrouter" and agent._credential_pool is throttled
 

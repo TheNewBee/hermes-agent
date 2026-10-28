@@ -1955,10 +1955,34 @@ def _fallback_chain_exhausted(agent, reason: FailoverReason | None) -> bool:
     return False
 
 
+_FALLBACK_POOL_WAIT_CAP_S = 600.0  # default for fallback.max_pool_wait_seconds (0 disables waiting)
+_FALLBACK_POOL_WAIT_SLICE_S = 30.0  # activity is touched between slices so the cron watchdog sees progress
+
+
+def _fallback_pool_wait_cap() -> float:
+    try:
+        from hermes_cli.config import load_config
+        return float((load_config() or {}).get("fallback", {}).get(
+            "max_pool_wait_seconds", _FALLBACK_POOL_WAIT_CAP_S))
+    except Exception:
+        return _FALLBACK_POOL_WAIT_CAP_S
+
+
+def _sleep_until(agent, until: float) -> None:
+    while (left := until - time.time()) > 0:
+        time.sleep(min(left, _FALLBACK_POOL_WAIT_SLICE_S))
+        touch = getattr(agent, "_touch_activity", None)
+        if callable(touch):
+            touch("waiting for fallback credential cooldown")
+
+
 def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
-    """True when every credential the candidate would use sits in an exhaustion cooldown longer
-    than the retry loop's longest wait (the 600s Retry-After cap): switching to it only fails the
-    turn the same way the primary just did (#89401). A short throttle still gets its chance."""
+    """True when the candidate should be skipped because every credential it would use is cooling.
+
+    If the earliest credential reopens within ``fallback.max_pool_wait_seconds`` (default 600s) and
+    the run's wall-clock budget has room, sleep until that expiry and let the candidate through
+    (activating it into an empty pool only fails the turn). Expiry beyond the cap, no expiry info,
+    a budget too small for the wait, or still unavailable after the wait => skip (#89401)."""
     pool = getattr(agent, "_credential_pool", None)
     if pool is None or (getattr(pool, "provider", "") or "").strip().lower() != fb_provider:
         try:
@@ -1969,7 +1993,20 @@ def _candidate_pool_exhausted(agent, fb_provider: str, fb_model: str) -> bool:
     if pool is None or not pool.has_credentials() or pool.has_available(model=fb_model):
         return False
     until = pool.next_available_at(model=fb_model)
-    return until is None or until - time.time() > 600
+    if until is None:
+        return True
+    wait = until - time.time()
+    if wait > _fallback_pool_wait_cap():
+        return True
+    budget = getattr(agent, "run_budget_seconds", None)
+    started = getattr(agent, "_run_budget_started_at", None)
+    if (isinstance(budget, (int, float)) and budget > 0 and isinstance(started, (int, float))
+            and wait > started + budget - time.time()):
+        return True
+    logger.info("Fallback %s/%s: every credential cooling; waiting %.0f s for the earliest to reopen",
+                fb_provider, fb_model, max(0.0, wait))
+    _sleep_until(agent, until)
+    return not pool.has_available(model=fb_model)
 
 
 def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
