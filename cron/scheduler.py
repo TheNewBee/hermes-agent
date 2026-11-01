@@ -1942,10 +1942,11 @@ def _raise_inactivity_timeout(agent, job_name: str, limit_s: float) -> None:
 
 def _run_agent_with_watchdog(
     agent, prompt: str, job: dict, job_id: str, job_name: str, task_id: str, cancel_event,
-    worker_state: Optional[dict] = None,
+    worker_state: Optional[dict] = None, conversation_history: Optional[list] = None,
 ) -> dict:
     """Run ``agent.run_conversation`` on a worker thread under the inactivity (not wall-clock)
-    watchdog: default 600s, override HERMES_CRON_TIMEOUT, 0 = unlimited."""
+    watchdog: default 600s, override HERMES_CRON_TIMEOUT, 0 = unlimited. ``conversation_history``
+    continues the same session (the one output-contract repair turn)."""
     _cron_timeout = _cron_inactivity_seconds()
     _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
     _POLL_INTERVAL = 5.0
@@ -1987,8 +1988,9 @@ def _run_agent_with_watchdog(
     _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     # Carry scheduler-scoped ContextVar state (e.g. env passthrough) into the worker thread.
     _cron_context = contextvars.copy_context()
+    _history_kw = {"conversation_history": conversation_history} if conversation_history is not None else {}
     _cron_future = _cron_pool.submit(
-        _cron_context.run, agent.run_conversation, prompt, task_id=task_id)
+        _cron_context.run, agent.run_conversation, prompt, task_id=task_id, **_history_kw)
     if worker_state is not None:
         worker_state["future"] = _cron_future
     _inactivity_timeout = False
@@ -2599,6 +2601,20 @@ def run_job(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
+
+        def _repair_turn(repair_prompt: str) -> dict:
+            # At most one call (cron/output_contract.py); a failed turn raises and the original stays.
+            r = _run_agent_with_watchdog(
+                agent, repair_prompt, job, job_id, job_name, scope.task_id, cancel_event,
+                worker_state=_worker_state, conversation_history=result.get("messages") or [])
+            return dict(r, final_response=_final_response_from_result(r, job_id, job_name, AIAgent))
+
+        from cron.output_contract import finalize_with_contract, verdict_path_for
+        final_response = finalize_with_contract(
+            final_response, job_prompt=str(job.get("prompt") or ""), repair=_repair_turn,
+            verdict_path=verdict_path_for(_get_hermes_home(), _cron_session_id),
+            skip=_is_cron_silence_response(final_response) or _cron_failure_marker_error(final_response) is not None,
+            extra={"session_id": _cron_session_id, "job_id": job_id, "model": model})
         if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
                 and _cron_failure_marker_error(final_response) is None):
             # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
