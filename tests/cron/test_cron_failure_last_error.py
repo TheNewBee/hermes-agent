@@ -52,8 +52,10 @@ def test_declared_failure_keeps_full_report_in_delivery(monkeypatch):
     _patch_pipeline(monkeypatch, final=f"[CRON_FAILURE]\n{REPORT_LEDE}{REPORT_BODY}")
     delivered = []
     seen = _capture_record(monkeypatch)
+    # Delivery rides the durable queue on the canonical path; the composed content is what lands.
     monkeypatch.setattr(
-        s, "_deliver_result", lambda job, content, **kw: delivered.append(content))
+        "cron.delivery_queue.enqueue",
+        lambda execution_id, job, content, **kw: delivered.append(content) or {"status": "pending"})
 
     s.run_one_job({"id": "declared-deliver", "name": "pm review", "deliver": "telegram"})
 
