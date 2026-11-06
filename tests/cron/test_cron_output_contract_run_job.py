@@ -6,6 +6,14 @@ from unittest.mock import patch
 
 import pytest
 
+# Import at collection time, before the per-test real-home guard (tests/conftest.py
+# _forbid_real_hermes_home_io) is installed. Importing run_agent runs hermes_bootstrap, which at
+# import reads paths beside the checkout: activate_dependencies -> pm.environments._payload_manifest
+# reads <checkout>/../manifest.json, and restore_interrupted_pull stats the update marker in the
+# git dir. Left to patch("run_agent.AIAgent") inside the test, those reads land under the real
+# Hermes home whenever the checkout sits there (an export in TMPDIR=~/.hermes/cache/scratch, or a
+# worktree whose git dir is ~/.hermes/hermes-agent/.git/worktrees/<name>), and the guard refuses.
+import run_agent
 from cron.scheduler import run_job
 
 _PROMPT = "Report. Return six bullets in order: Done, In progress, Blocking, Fixed, Next, Cause/goal."
