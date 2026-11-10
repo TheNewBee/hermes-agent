@@ -2237,14 +2237,29 @@ def _normalize_newlines(text: str) -> str:
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _run_doc_header(job: dict, title: str, job_id: str, prompt: str, *, prompt_stamp: str = "") -> str:
-    """Header of the persisted run document (title, ids, schedule, prompt)."""
+def _run_trigger() -> Optional[str]:
+    """``scheduled`` if this fire's ledger row ran a schedule slot (tick, misfire catch-up),
+    ``manual`` for an off-slot fire (run-now, dashboard trigger, cronjob tool); ``None`` when no
+    ledger row is bound, so no Trigger line is written rather than a guess."""
+    from cron.execution_identity import current_cron_execution
+
+    ex = current_cron_execution()
+    if ex is None or not ex.source:
+        return None
+    return "scheduled" if ex.scheduled_instant else "manual"
+
+
+def _run_doc_header(job: dict, title: str, job_id: str, prompt: str, *, prompt_stamp: str = "",
+                    trigger: Optional[str] = None) -> str:
+    """Header of the persisted run document (title, ids, schedule, trigger, prompt). Without a
+    trigger the header is byte-identical to the pre-Trigger format."""
     return (
         f"# Cron Job: {title}\n\n"
         f"**Job ID:** {job_id}\n"
         f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"**Schedule:** {job.get('schedule_display', 'N/A')}\n\n"
-        f"{prompt_stamp}{_PROMPT_HEADING}{prompt}{_PROMPT_SEPARATOR}"
+        f"**Schedule:** {job.get('schedule_display', 'N/A')}\n"
+        + (f"**Trigger:** {trigger}\n" if trigger else "")
+        + f"\n{prompt_stamp}{_PROMPT_HEADING}{prompt}{_PROMPT_SEPARATOR}"
     )
 
 
@@ -2658,7 +2673,7 @@ def run_job(
         logged_response = _normalize_newlines(logged_response)
         output = (
             _run_doc_header(job, job_name, job_id, framed_prompt,
-                            prompt_stamp=f"{_PROMPT_FRAME}{len(framed_prompt)}\n")
+                            prompt_stamp=f"{_PROMPT_FRAME}{len(framed_prompt)}\n", trigger=_run_trigger())
             + f"{_RESPONSE_FRAME}{len(logged_response)}\n{_RESPONSE_HEADING}{logged_response}{_RESPONSE_TERMINATOR}"
         )
         logger.info("Job '%s' completed successfully", job_name)
@@ -2688,7 +2703,7 @@ def run_job(
             _audit.write({}, error_msg)
         from cron.scheduler_diagnostics import format_run_error
         output = (
-            _run_doc_header(job, f"{job_name} (FAILED)", job_id, prompt)
+            _run_doc_header(job, f"{job_name} (FAILED)", job_id, prompt, trigger=_run_trigger())
             + format_run_error(e)
         )
         return False, output, "", error_msg
