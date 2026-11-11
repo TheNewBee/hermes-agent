@@ -281,6 +281,11 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     if re.search(r"idle for \d+s\s*\(limit \d+s\)", lower):
         return inactivity_notice(job_name, job_id)
 
+    # Per-job wall-clock cap (``max_runtime_seconds``): one line, no provider blame.
+    wall = re.search(r"ended after (\d+)s\s*\(limit (\d+)s\)", lower)
+    if wall:
+        return f"⚠️ Cron '{job_name}' ended after {wall.group(1)}s (limit {wall.group(2)}s)."
+
     # no_agent jobs never reach a model, so provider errors are structurally impossible for them:
     # gate on job MODE before classifying, or a script's own wording ("429", "timed out") would
     # blame the wrong subsystem.
@@ -1954,16 +1959,34 @@ def _raise_inactivity_timeout(agent, job_name: str, limit_s: float) -> None:
         f"— last activity: {_last_desc}")
 
 
+def _job_max_runtime_seconds(job: dict) -> Optional[float]:
+    """Optional per-job wall-clock cap (``max_runtime_seconds``); missing/invalid/<=0 = none."""
+    raw = job.get("max_runtime_seconds")
+    if raw in (None, "", False):
+        return None
+    try:
+        limit = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Job '%s': ignoring invalid max_runtime_seconds=%r", job.get("id"), raw)
+        return None
+    return limit if limit > 0 else None
+
+
 def _run_agent_with_watchdog(
     agent, prompt: str, job: dict, job_id: str, job_name: str, task_id: str, cancel_event,
     worker_state: Optional[dict] = None, conversation_history: Optional[list] = None,
 ) -> dict:
-    """Run ``agent.run_conversation`` on a worker thread under the inactivity (not wall-clock)
-    watchdog: default 600s, override HERMES_CRON_TIMEOUT, 0 = unlimited. ``conversation_history``
-    continues the same session (the one output-contract repair turn)."""
+    """Run ``agent.run_conversation`` on a worker thread under the inactivity watchdog (default
+    600s, override HERMES_CRON_TIMEOUT, 0 = unlimited) and the optional per-job wall-clock cap
+    ``max_runtime_seconds``. ``conversation_history`` continues the same session (the one
+    output-contract repair turn); the wall clock spans both turns via ``worker_state``."""
     _cron_timeout = _cron_inactivity_seconds()
     _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
     _POLL_INTERVAL = 5.0
+    _wall_limit = _job_max_runtime_seconds(job)
+    _wall_start = (worker_state.setdefault("wall_start", time.monotonic())
+                   if worker_state is not None else time.monotonic())
+    _wall_timeout = False
     # Heartbeat the one-shot run_claim while alive: without it a long run looks like a dead owner
     # and gets re-dispatched / stale-removed out from under the live run.
     # Keep the one-shot run_claim fresh while the run is alive (#62002): the claim TTL is a dead-owner
@@ -2041,17 +2064,24 @@ def _run_agent_with_watchdog(
             # loop / hung ``get_activity_summary`` on this thread can no longer keep the 600s inactivity
             # limit from firing (#94285).
             _watch_thread.start()
-        if _cron_inactivity_limit is None and not _is_oneshot and cancel_event is None:
+        if (_cron_inactivity_limit is None and _wall_limit is None and not _is_oneshot
+                and cancel_event is None):
             result = _cron_future.result()
         else:
             result = None
             while True:
-                done, _ = concurrent.futures.wait({_cron_future}, timeout=_POLL_INTERVAL)
+                _poll = _POLL_INTERVAL
+                if _wall_limit is not None:
+                    _poll = max(0.01, min(_poll, _wall_start + _wall_limit - time.monotonic()))
+                done, _ = concurrent.futures.wait({_cron_future}, timeout=_poll)
                 if done:
                     _abort_if_fire_claim_lost()
                     result = _cron_future.result()
                     break
                 if _inactivity_timeout:
+                    break
+                if _wall_limit is not None and time.monotonic() - _wall_start >= _wall_limit:
+                    _wall_timeout = True
                     break
                 _abort_if_fire_claim_lost()
                 _heartbeat_run_claim_if_due()
@@ -2065,6 +2095,11 @@ def _run_agent_with_watchdog(
 
     if _inactivity_timeout:
         _raise_inactivity_timeout(agent, job_name, _cron_inactivity_limit)
+    if _wall_timeout:
+        _elapsed = time.monotonic() - _wall_start
+        logger.error("Job '%s' ended after %.0fs (max_runtime_seconds %.0fs)", job_name, _elapsed, _wall_limit)
+        request_hard_interrupt(agent, "Cron job reached max_runtime_seconds", tool_reason="cron wall-clock limit")
+        raise TimeoutError(f"Cron job '{job_name}' ended after {int(_elapsed)}s (limit {int(_wall_limit)}s)")
 
     if not isinstance(result, dict):
         raise RuntimeError(
