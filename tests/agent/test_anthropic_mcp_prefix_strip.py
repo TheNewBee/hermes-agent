@@ -117,6 +117,24 @@ class TestAnthropicOAuthAliasRoundTrip:
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].name == "session_search"
 
+    def test_oauth_alias_nested_in_deferred_bridge_calls_is_reversed(self):
+        """The prose rewrite puts ``chat_history_lookup`` in the deferred catalog, so the model
+        passes it as a nested name to tool_call / tool_describe; it must dispatch as session_search."""
+        import json
+        transport = self._get_transport()
+        response = _make_response(
+            _make_tool_use_block("mcp__tool_call", "tc_1",
+                                 {"calls": [{"name": "chat_history_lookup", "arguments": {"query": "x"}}]}),
+            _make_tool_use_block("mcp__tool_describe", "tc_2", {"names": ["mcp__chat_history_lookup", "cronjob_manage"]}),
+        )
+        registry = _FakeRegistry({"tool_call", "tool_describe", "session_search", "cronjob_manage"})
+        with patch("tools.registry.registry", registry):
+            result = transport.normalize_response(response, strip_tool_prefix=True)
+
+        assert result.tool_calls and len(result.tool_calls) == 2
+        assert json.loads(result.tool_calls[0].arguments)["calls"][0]["name"] == "session_search"
+        assert json.loads(result.tool_calls[1].arguments)["names"] == ["session_search", "cronjob_manage"]
+
     def test_oauth_memory_alias_round_trips_to_registry_name(self):
         transport = self._get_transport()
         block = _make_tool_use_block("mcp__context_notes")

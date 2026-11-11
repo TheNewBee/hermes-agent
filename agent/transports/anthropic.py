@@ -23,6 +23,32 @@ def _unprefix_oauth_tool_name(name: str) -> str:
     return _OAUTH_TOOL_NAME_REVERSE_ALIASES.get(bare, name)
 
 
+def _unalias_bridge_input(name: str, args: Any) -> Any:
+    """The OAuth prose rewrite also renames deferred tools in the system-prompt catalog
+    (``session_search`` -> ``chat_history_lookup``), so the model passes the wire alias as a
+    *nested* name to tool_call / tool_describe. Reverse it there too, or the call is unknown."""
+    from agent.anthropic_adapter import _OAUTH_TOOL_NAME_REVERSE_ALIASES as rev
+    if not isinstance(args, dict) or name not in ("tool_call", "tool_describe"):
+        return args
+    from tools.registry import registry as _tool_registry
+
+    def fix(n: Any) -> Any:
+        if not isinstance(n, str) or _tool_registry.get_entry(n):  # a real tool under that name wins
+            return n
+        return rev.get(n.removeprefix(_MCP_PREFIX), n)
+
+    args = dict(args)
+    if isinstance(args.get("calls"), list):
+        args["calls"] = [{**c, "name": fix(c.get("name"))} if isinstance(c, dict) else c for c in args["calls"]]
+    if "name" in args:
+        args["name"] = fix(args["name"])
+    if isinstance(args.get("names"), list):
+        args["names"] = [fix(n) for n in args["names"]]
+    elif "names" in args:
+        args["names"] = fix(args["names"])
+    return args
+
+
 # build_kwargs params forwarded to build_anthropic_kwargs, with the defaults applied when absent.
 _BUILD_KWARG_DEFAULTS = {
     "max_tokens": 16384, "reasoning_config": None, "tool_choice": None, "is_oauth": False, "preserve_dots": False,
@@ -89,7 +115,8 @@ class AnthropicTransport(ProviderTransport):
                 name = block.name
                 if strip_tool_prefix and name.startswith(_MCP_PREFIX):
                     name = _unprefix_oauth_tool_name(name)
-                tool_calls.append(ToolCall(id=block.id, name=name, arguments=json.dumps(block.input)))
+                args = _unalias_bridge_input(name, block.input) if strip_tool_prefix else block.input
+                tool_calls.append(ToolCall(id=block.id, name=name, arguments=json.dumps(args)))
         provider_data = {"reasoning_details": reasoning_details} if reasoning_details else {}
         stop_details = _to_plain_data(getattr(response, "stop_details", None))
         if stop_details is not None:
