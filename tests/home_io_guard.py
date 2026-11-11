@@ -11,9 +11,39 @@ import sqlite3
 import sys
 import threading
 
-_INTERPRETER_PREFIXES = tuple({
+_CHECKOUT = Path(__file__).resolve().parent.parent
+
+
+def _symlinked_spellings(paths, prefixes) -> set[Path]:
+    """Unresolved spellings of *prefixes* that *paths* go through. A venv's ``home`` can name its
+    base python via a symlink (python-build-standalone's ``cpython-3.11-...`` ->
+    ``cpython-3.11.15-...``): sys._base_executable and lib-dynload then sit under the unresolved
+    name, and realpath(sys.executable) lstats it. The checkout's own tree already covers this
+    when the venv lives inside it; a worktree elsewhere using that venv does not."""
+    found = set()
+    for path in paths:
+        if path and os.path.isabs(path):
+            found.update(a for a in Path(os.path.abspath(path)).parents if a.resolve() in prefixes)
+    return found
+
+
+def _linked_worktree_git_dir(checkout: Path) -> set[Path]:
+    """A linked worktree's private admin dir (its ``.git`` is a ``gitdir:`` file, the dir sits in the
+    main repo's ``.git/worktrees``). Import-time update recovery stats markers there: the
+    checkout's own metadata, not Hermes state. The shared common dir stays guarded."""
+    try:
+        text = (checkout / ".git").read_text(encoding="utf-8")
+    except OSError:  # a main checkout's .git is a directory, already inside the checkout
+        return set()
+    return {(checkout / text.removeprefix("gitdir:").strip()).resolve()} if text.startswith("gitdir:") else set()
+
+
+_RESOLVED_PREFIXES = {
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
-} | {
+}
+_INTERPRETER_PREFIXES = tuple(_RESOLVED_PREFIXES | _symlinked_spellings(
+    (*sys.path, sys.executable, getattr(sys, "_base_executable", "")), _RESOLVED_PREFIXES,
+) | _linked_worktree_git_dir(_CHECKOUT) | {
     # A PM-activated developer shell runs sys.prefix's python against a dependency generation
     # whose site-packages sits under the (real) Hermes home; third-party imports from it are the
     # interpreter's installation, not Hermes state.
@@ -23,13 +53,19 @@ _INTERPRETER_PREFIXES = tuple({
     # INSTALL_DIR=$HERMES_HOME/hermes-agent). Reading test data, sources for tracebacks, or the
     # checkout's own .venv is not Hermes state; without this every run from a default install
     # trips on its first traceback.
-    Path(__file__).resolve().parent.parent,
+    _CHECKOUT,
 })
 # The same prefixes as plain strings for the check() fast path. PurePath comparison folds case on
 # Windows; ``os.path.normcase`` (identity on POSIX) reproduces that for string compares. Prefixes
 # resolve once at import, as before: they are fixed for the process lifetime.
 _normcase = os.path.normcase
 _INTERPRETER_PREFIX_STRS = tuple(_normcase(os.fspath(p)) for p in _INTERPRETER_PREFIXES)
+# Install-location probes (pm.environments.store_root): a sealed payload's manifest.json beside
+# the tree, then install-stamp.json in the checkout and each ancestor. Install metadata, not
+# Hermes state, even when the checkout sits under the home (a worktree in ~/.hermes/worktrees);
+# reads only, never writes.
+_INSTALL_PROBES = frozenset(_normcase(os.fspath(p)) for p in (
+    _CHECKOUT.parent / "manifest.json", *(a / "install-stamp.json" for a in _CHECKOUT.parents)))
 
 
 def _within(path: str, prefix: str) -> bool:
@@ -79,6 +115,8 @@ class HomeIOGuard:
             # link to compare inode identity); resolving it names whatever file that fd holds,
             # which is not I/O against the home.
             if metadata and (absolute == "/proc" or absolute.startswith("/proc" + os.sep)):
+                return
+            if absolute in _INSTALL_PROBES and not destructive:
                 return
             resolved = self._refuse_installed_app_change(value, absolute) if destructive else None
             roots = tuple(_normcase(os.fspath(r)) for r in self.roots())

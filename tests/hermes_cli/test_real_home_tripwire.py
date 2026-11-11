@@ -229,3 +229,41 @@ def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 passed" in result.stdout
+
+
+def test_install_probes_beside_a_checkout_inside_a_guarded_root_are_readable():
+    """A worktree under the home (~/.hermes/worktrees/<name>) is probed for a sealed payload's
+    manifest.json beside it and install-stamp.json in each ancestor (pm.environments.store_root).
+    Reading those is install metadata; writing them, or any other sibling, is still refused."""
+    from tests.home_io_guard import HomeIOGuard
+
+    guard = HomeIOGuard(lambda: [PROJECT_ROOT.parent.parent])
+    guard.check(PROJECT_ROOT.parent / "manifest.json")
+    guard.check(PROJECT_ROOT.parent / "install-stamp.json", metadata=True)
+    for refused in (dict(value=PROJECT_ROOT.parent / "manifest.json", destructive=True),
+                    dict(value=PROJECT_ROOT.parent / ".env")):
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            guard.check(**refused)
+
+
+def test_linked_worktree_admin_dir_and_symlinked_interpreter_are_installation(tmp_path):
+    """A worktree checkout run with a venv from elsewhere under the home: update recovery stats
+    markers in the worktree's private git dir, and realpath(sys.executable) lstats the
+    unresolved spelling of the base python (cpython-3.11-... -> cpython-3.11.15-...)."""
+    from tests.home_io_guard import _linked_worktree_git_dir, _symlinked_spellings
+
+    admin = tmp_path / "repo" / ".git" / "worktrees" / "wt"
+    admin.mkdir(parents=True)
+    checkout = tmp_path / "wt"
+    checkout.mkdir()
+    (checkout / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
+    assert _linked_worktree_git_dir(checkout) == {admin.resolve()}
+    (tmp_path / "main" / ".git").mkdir(parents=True)
+    assert _linked_worktree_git_dir(tmp_path / "main") == set()
+
+    real = tmp_path / "cpython-3.11.15"
+    (real / "bin").mkdir(parents=True)
+    alias = tmp_path / "cpython-3.11"
+    alias.symlink_to(real, target_is_directory=True)
+    found = _symlinked_spellings([str(alias / "bin" / "python3.11"), str(tmp_path / "other")], {real.resolve()})
+    assert found == {alias}
