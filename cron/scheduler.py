@@ -282,7 +282,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
         return inactivity_notice(job_name, job_id)
 
     # Per-job wall-clock cap (``max_runtime_seconds``): one line, no provider blame.
-    wall = re.search(r"ended after (\d+)s\s*\(limit (\d+)s\)", lower)
+    wall = None if job.get("no_agent") else re.search(r"ended after (\d+)s\s*\(limit (\d+)s\)", lower)
     if wall:
         return f"⚠️ Cron '{job_name}' ended after {wall.group(1)}s (limit {wall.group(2)}s)."
 
