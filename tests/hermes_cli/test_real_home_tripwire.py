@@ -267,3 +267,31 @@ def test_linked_worktree_admin_dir_and_symlinked_interpreter_are_installation(tm
     alias.symlink_to(real, target_is_directory=True)
     found = _symlinked_spellings([str(alias / "bin" / "python3.11"), str(tmp_path / "other")], {real.resolve()})
     assert found == {alias}
+
+
+def test_symlinked_interpreter_exemption_still_refuses_real_home_writes(tmp_path, monkeypatch):
+    """The durable venv's base python sits under the home via an alias (.hermes-runtime/python/
+    <gen>/cpython-3.11-... -> cpython-3.11.15-...); release-gate setup errored on it (t_0537bf12).
+    Allowing that installation must not admit writes to the home around it."""
+    from tests import conftest
+    from tests import home_io_guard as guard
+
+    root = tmp_path / "protected"
+    real = root / "hermes-agent" / ".hermes-runtime" / "python" / "gen" / "cpython-3.11.15-linux"
+    (real / "lib").mkdir(parents=True)
+    (real / "lib" / "os.py").write_text("", encoding="utf-8")
+    alias = real.with_name("cpython-3.11-linux")
+    alias.symlink_to(real, target_is_directory=True)
+    assert guard._symlinked_spellings([str(alias / "bin" / "python3.11")], {real.resolve()}) == {alias}
+    monkeypatch.setattr(guard, "_INTERPRETER_PREFIX_STRS",
+                        (*guard._INTERPRETER_PREFIX_STRS, os.fspath(real), os.fspath(alias)))
+    monkeypatch.setattr(conftest, "_REAL_HERMES_ROOT_CANDIDATES", [root])
+    try:
+        assert os.path.realpath(alias / "lib" / "os.py") == os.fspath(real / "lib" / "os.py")
+        assert (alias / "lib" / "os.py").read_text(encoding="utf-8") == ""
+        for target in (root / "state.db", root / "hermes-agent" / ".env", alias.parent / "planted"):
+            with pytest.raises(AssertionError, match="REAL hermes home"):
+                target.write_text("x", encoding="utf-8")
+    finally:
+        monkeypatch.setattr(conftest, "_REAL_HERMES_ROOT_CANDIDATES", [])
+    assert not any(p.exists() for p in (root / "state.db", root / "hermes-agent" / ".env", alias.parent / "planted"))
