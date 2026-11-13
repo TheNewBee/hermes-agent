@@ -3732,6 +3732,13 @@ def invalidate_descendants_for_parent_reopen(
     return {"invalidated": invalidated, "terminations": terminations}
 
 
+def is_held_body(body: Optional[str]) -> bool:
+    """A triage card parked on purpose; specifier/decomposer must leave it in
+    triage (incident t_e2ebca73: a HOLD card was assigned and dispatched)."""
+    text = (body or "").lower()
+    return text.lstrip().startswith("status: hold") or "do not dispatch" in text or "keep it in triage" in text
+
+
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
@@ -3748,7 +3755,7 @@ def specify_triage_task(
             "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
-        if existing is None:
+        if existing is None or is_held_body(existing["body"]):
             return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
