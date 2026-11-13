@@ -578,6 +578,18 @@ def test_schedule_exposed_to_codex_runtime_workers():
     assert "kanban_schedule" in EXPOSED_TOOLS
 
 
+def test_lifecycle_tools_are_direct_kanban_toolset_members():
+    """A lifecycle tool missing from the core list was deferred behind tool_search,
+    so workers reached for the visible kanban_create with schedule args instead."""
+    from tools.kanban_tools import _RUN_LIFECYCLE_TOOLS
+    from tools.tool_search import _DEFAULT_DEFERRED_TOOLS, is_deferrable_tool_name
+    from toolsets import TOOLSETS
+
+    for name in _RUN_LIFECYCLE_TOOLS:
+        assert name in TOOLSETS["kanban"]["tools"], name
+        assert not is_deferrable_tool_name(name, _DEFAULT_DEFERRED_TOOLS), name
+
+
 def test_block_dependency_without_open_parent_is_rekinded(worker_env):
     """kind=dependency with no incomplete parent must not park in todo; the
     tool reports the landed kind and tells the worker why."""
