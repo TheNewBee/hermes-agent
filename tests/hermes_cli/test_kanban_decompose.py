@@ -256,3 +256,19 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+
+
+def test_decompose_skips_llm_for_already_decomposed_root(kanban_home):
+    """A re-triaged root that already fanned out is refused by the DB, so no LLM call is spent."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="re-triaged root", triage=True)
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, "decomposed", {"child_ids": [], "root_assignee": None})
+
+    llm = MagicMock()
+    with patch("agent.auxiliary_client.call_llm", llm):
+        outcome = decomp.decompose_task(tid, author="me")
+
+    assert outcome.ok is False
+    assert outcome.reason == "task already decomposed"
+    llm.assert_not_called()
