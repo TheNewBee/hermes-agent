@@ -606,10 +606,21 @@ def _apply_claude_code_identity(system, anthropic_tools, anthropic_messages, to_
             tool["name"] = to_wire(tool["name"])
         if isinstance(tool.get("description"), str):
             tool["description"] = _apply_oauth_prose_aliases(tool["description"])  # prose-safe aliases only
+    catalog_reads = set()  # tool_use ids of tool_describe / tool_search: their results echo real schemas
     for msg in anthropic_messages:
         for block in msg.get("content") if isinstance(msg.get("content"), list) else []:
             if isinstance(block, dict) and block.get("type") == "tool_use" and "name" in block:
+                if block["name"] in ("tool_describe", "tool_search"):
+                    catalog_reads.add(block.get("id"))
                 block["name"] = to_wire(block["name"])  # tool_result pairs by id, not name
+            elif isinstance(block, dict) and block.get("type") == "tool_result" and block.get("tool_use_id") in catalog_reads:
+                content = block.get("content")  # tool_call results are tool output (data): left verbatim
+                if isinstance(content, str):
+                    block["content"] = _apply_oauth_prose_aliases(content)
+                elif isinstance(content, list):
+                    block["content"] = [{**p, "text": _apply_oauth_prose_aliases(p["text"])}
+                                        if isinstance(p, dict) and isinstance(p.get("text"), str) else p
+                                        for p in content]
     return system
 
 

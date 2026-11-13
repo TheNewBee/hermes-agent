@@ -15,6 +15,7 @@ tools, or the bare name for native tools) so the dispatcher is unaffected.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -265,6 +266,25 @@ class TestAnthropicOAuthClassifierAlias:
         )
         assert "chat_history_lookup" in system_text
         assert "session_search" not in system_text
+
+    def test_oauth_aliases_session_search_in_catalog_read_results_only(self):
+        """tool_describe / tool_search results echo real schemas back onto the wire; alias them like
+        tool descriptions. A tool_call result is the tool's own output (data) and stays verbatim."""
+        tc = lambda i, n: {"id": i, "type": "function", "function": {"name": n, "arguments": "{}"}}
+        kwargs = self._build(
+            [self._tool("tool_describe"), self._tool("tool_call")],
+            messages=[
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "", "tool_calls": [tc("d1", "tool_describe"), tc("c1", "tool_call")]},
+                {"role": "tool", "tool_call_id": "d1", "content": '{"tools": {"session_search": {}}}'},
+                {"role": "tool", "tool_call_id": "c1", "content": "grep: session_search found"},
+            ],
+        )
+        results = {b["tool_use_id"]: json.dumps(b["content"]) for m in kwargs["messages"]
+                   for b in (m["content"] if isinstance(m["content"], list) else [])
+                   if b.get("type") == "tool_result"}
+        assert "chat_history_lookup" in results["d1"] and "session_search" not in results["d1"]
+        assert "session_search" in results["c1"]
 
     def test_oauth_does_not_alias_longer_identifier_containing_token(self):
         """Word-boundary matching: a path like tools/session_search_tool.py
