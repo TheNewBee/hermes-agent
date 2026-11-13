@@ -80,3 +80,27 @@ def test_specify_records_audit_comment_only_when_author_given(kanban_home):
     assert comments2 == []
 
 
+
+
+@pytest.mark.parametrize("body", [
+    "STATUS: HOLD. Answer in a live session.",
+    "Paper-only question. Do not dispatch.",
+    "keep it in triage until JY replies",
+])
+def test_held_triage_card_is_never_promoted_or_assigned(kanban_home, body):
+    """Incident t_e2ebca73: a HOLD card was assigned+promoted by the specifier."""
+    from hermes_cli import kanban_decompose, kanban_specify
+    from hermes_cli.kanban_db_graph import decompose_triage_task
+
+    with kbc.connect() as conn:
+        tid = _create_triage(conn, title="held question", body=body)
+        assert kb.specify_triage_task(conn, tid, body="rewritten", assignee="default") is False
+        assert decompose_triage_task(
+            conn, tid, root_assignee="default",
+            children=[{"title": "c", "body": "", "assignee": "default", "parents": []}],
+        ) is None
+        task = kb.get_task(conn, tid)
+    assert (task.status, task.assignee, task.body) == ("triage", None, body)
+    # The dispatcher tick and CLI sweeps source ids from these lists.
+    assert tid not in kanban_decompose.list_triage_ids()
+    assert tid not in kanban_specify.list_triage_ids()

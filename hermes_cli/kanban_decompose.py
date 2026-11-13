@@ -340,4 +340,5 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column."""
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [row.id for row in rows]
+    # Held cards never reach the aux LLM or eat the dispatcher's per-tick cap.
+    return [row.id for row in rows if not kb.is_held_body(row.body)]
