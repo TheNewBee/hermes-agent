@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -143,6 +144,25 @@ def _task_prompt_fields(task: kb.Task) -> dict[str, str]:
     }
 
 
+# Rate-limit backoff per (profile home, aux task): the gateway's auto-decompose tick re-ran a
+# 429'd call every minute. Account-wide limits, so not keyed per task id. In-process only.
+_RATE_LIMIT_BACKOFF_BASE_S = 60.0
+_RATE_LIMIT_BACKOFF_CAP_S = 3600.0
+_aux_backoff: dict[tuple[str, str], tuple[float, int]] = {}  # key -> (not_before, consecutive 429s)
+
+
+def _backoff_key(aux_task: str) -> tuple[str, str]:
+    from hermes_constants import hermes_home_key
+    return hermes_home_key(), aux_task
+
+
+def _rate_limit_wait(exc: Exception, failures: int) -> float:
+    """Capped exponential backoff, or the provider's declared reset when that is later."""
+    from agent.auxiliary_health import rate_limit_reset_seconds
+    backoff = min(_RATE_LIMIT_BACKOFF_BASE_S * 2 ** (failures - 1), _RATE_LIMIT_BACKOFF_CAP_S)
+    return max(backoff, rate_limit_reset_seconds(exc) or 0.0)
+
+
 def _call_aux(verb: str, task_id: str, *, aux_task: str, system: str, user: str,
               max_tokens: int, timeout: int, log: logging.Logger = logger) -> tuple[Optional[str], str]:
     """One auxiliary LLM call; ``(reply_text, "")`` or ``(None, reason)``.
@@ -150,12 +170,19 @@ def _call_aux(verb: str, task_id: str, *, aux_task: str, system: str, user: str,
     ``call_llm`` applies all ``auxiliary.<aux_task>.*`` config (provider/model/
     base_url, extra_body, reasoning_effort, retries). Imported lazily so a
     missing aux client degrades to a skip instead of an import-time crash.
+    After a rate-limit/quota error the aux task is skipped until its backoff expires.
     """
     try:
-        from agent.auxiliary_client import call_llm
+        from agent.auxiliary_client import _is_payment_error, _is_rate_limit_error, call_llm
     except Exception as exc:  # pragma: no cover — import smoke test
         log.debug("%s: auxiliary client import failed: %s", verb, exc)
         return None, "auxiliary client unavailable"
+    key = _backoff_key(aux_task)
+    not_before, failures = _aux_backoff.get(key, (0.0, 0))
+    if time.time() < not_before:
+        until = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(not_before))
+        log.debug("%s: %s backing off after rate limit until %s", verb, task_id, until)
+        return None, f"rate-limited; retry after {until}"
     # Specify/decompose run outside any agent turn (CLI, dashboard route, gateway watcher), so no
     # conversation affinity scope is bound and the relay-affinity headers (x-opencode-session, the
     # OpenRouter/Portal sticky key) are omitted — the OpenCode Go relay rejects that with 400
@@ -176,11 +203,17 @@ def _call_aux(verb: str, task_id: str, *, aux_task: str, system: str, user: str,
         )
     except Exception as exc:
         suffix = " — skipping" if verb == "specify" else ""
+        if _is_rate_limit_error(exc) or _is_payment_error(exc):
+            failures += 1
+            wait = _rate_limit_wait(exc, failures)
+            _aux_backoff[key] = (time.time() + wait, failures)
+            suffix += f"; backing off {int(wait)}s"
         log.info("%s: API call failed for %s (%s)%s", verb, task_id, exc, suffix)
         return None, f"LLM error: {type(exc).__name__}"
     finally:
         if affinity_token is not None:
             reset_affinity_scope(affinity_token)
+    _aux_backoff.pop(key, None)
     try:
         return resp.choices[0].message.content or "", ""
     except Exception:

@@ -67,7 +67,27 @@ _CANDIDATE_QUARANTINE_TTL: dict[str, Optional[float]] = {
 }
 
 
-def fallback_candidate_quarantine_ttl(reason: Optional[str]) -> Optional[float]:
+def rate_limit_reset_seconds(exc: Exception) -> Optional[float]:
+    """Provider-declared wait on a 429 (``resets_at``/``resets_in_seconds``/``Retry-After``/message
+    grammar), or None when the error names none."""
+    from agent.error_classifier import _rate_limit_reset_seconds
+    body = getattr(exc, "body", None)
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    try:
+        return _rate_limit_reset_seconds(str(exc), body if isinstance(body, dict) else {}, headers)
+    except Exception:
+        return None
+
+
+def fallback_candidate_quarantine_ttl(
+    reason: Optional[str], exc: Optional[Exception] = None,
+) -> Optional[float]:
     """Seconds to hide a fallback candidate for ``reason`` (a ``_FALLBACK_REASONS`` label, or None
-    for a stale credential); None means the long default TTL."""
-    return _CANDIDATE_QUARANTINE_TTL.get(reason or "")
+    for a stale credential); None means the long default TTL. A rate limit that names its reset
+    (Codex ``usage_limit_reached`` + ``resets_at``) holds until then, not the 60 s transient hold."""
+    ttl = _CANDIDATE_QUARANTINE_TTL.get(reason or "")
+    if reason == "rate limit" and exc is not None:
+        reset = rate_limit_reset_seconds(exc)
+        if reset and reset > (ttl or 0):
+            return reset
+    return ttl
