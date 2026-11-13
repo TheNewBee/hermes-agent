@@ -41,8 +41,6 @@ class AliasNotReverseMapped(AssertionError):
 KNOWN: dict[str, tuple[str, str]] = {
     "discovery_env": (r"configured endpoint probed=False \(native host saw \d+ GETs\); relay catalog served=False",
                       "#120844 Anthropic model discovery ignores ANTHROPIC_BASE_URL"),
-    "alias_describe": (r"tool_describe did not resolve the advertised alias: .*not_found.*chat_history_lookup",
-                       "#120858 wire alias chat_history_lookup not reverse-mapped in tool_describe args"),
 }
 RELAY_ONLY_MODEL = "claude-e2e-relay-only-7"
 OAUTH_TOKEN = "sk-ant-oat01-e2e-fake-oauth-token"

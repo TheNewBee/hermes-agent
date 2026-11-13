@@ -127,11 +127,12 @@ class TestAnthropicOAuthAliasRoundTrip:
                                  {"calls": [{"name": "chat_history_lookup", "arguments": {"query": "x"}}]}),
             _make_tool_use_block("mcp__tool_describe", "tc_2", {"names": ["mcp__chat_history_lookup", "cronjob_manage"]}),
         )
-        registry = _FakeRegistry({"tool_call", "tool_describe", "session_search", "cronjob_manage"})
+        # Bridge tools are dispatched by model_tools, never registry entries: keep them OUT of the fake.
+        registry = _FakeRegistry({"session_search", "cronjob_manage"})
         with patch("tools.registry.registry", registry):
             result = transport.normalize_response(response, strip_tool_prefix=True)
 
-        assert result.tool_calls and len(result.tool_calls) == 2
+        assert [tc.name for tc in result.tool_calls] == ["tool_call", "tool_describe"]
         assert json.loads(result.tool_calls[0].arguments)["calls"][0]["name"] == "session_search"
         assert json.loads(result.tool_calls[1].arguments)["names"] == ["session_search", "cronjob_manage"]
 
