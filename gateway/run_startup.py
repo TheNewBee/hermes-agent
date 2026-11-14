@@ -968,6 +968,7 @@ class GatewayStartupMixin:
             self._gateway_health_export_runtime = start_gateway_health_export(load_config())
             if getattr(self._gateway_health_export_runtime, "enabled", False):
                 logger.info("Gateway health OTLP export: enabled")
+        self._start_memory_monitor()
         # Supply-chain advisories: log only (never block startup or surface to users; only the operator can act).
         with _log_suppressed(logging.DEBUG, "security advisory check failed at gateway startup", exc_info=True):
             from hermes_cli.security_advisories import detect_compromised, gateway_log_message
@@ -975,6 +976,16 @@ class GatewayStartupMixin:
             if _adv_msg:
                 logger.warning("%s", _adv_msg)
                 logger.warning("Run `hermes doctor` on the gateway host for full remediation steps.")
+
+    def _start_memory_monitor(self) -> None:
+        """Start the periodic ``[MEMORY]`` logger when ``logging.memory_monitor.enabled`` is set.
+        The call site was lost when 51c68d4ab1 rewrote start_gateway; never raises."""
+        with _log_suppressed(logging.DEBUG, "gateway memory monitor startup failed", exc_info=True):
+            from hermes_cli.config import load_config
+            cfg = (load_config().get("logging") or {}).get("memory_monitor") or {}
+            if cfg.get("enabled"):
+                from gateway.memory_monitor import start_memory_monitoring
+                start_memory_monitoring(interval_seconds=float(cfg.get("interval_seconds", 300)))
 
     def _start_log_retired_session_reset(self) -> None:
         """Warn per served profile whose config still declares an idle/daily ``session_reset``,
