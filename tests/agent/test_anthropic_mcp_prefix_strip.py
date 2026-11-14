@@ -286,6 +286,30 @@ class TestAnthropicOAuthClassifierAlias:
         assert "chat_history_lookup" in results["d1"] and "session_search" not in results["d1"]
         assert "session_search" in results["c1"]
 
+    def test_oauth_replayed_signed_thinking_bridge_turn_stays_aliased(self):
+        """Real route (t_3e75276d): a signed-thinking turn replays from the raw response blocks, so
+        the tool_use name is already ``mcp__tool_describe`` and its input carries the name the
+        transport reversed to ``session_search``. Neither the input nor the catalog-read result may
+        put the raw name back on the wire (billing classifier), and the model must see the alias it sent."""
+        raw_use = {"type": "tool_use", "id": "d1", "name": "mcp__tool_describe", "input": {"names": ["chat_history_lookup"]}}
+        kwargs = self._build(
+            [self._tool("tool_describe"), self._tool("tool_call")],
+            messages=[
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "", "anthropic_content_blocks": [
+                    {"type": "thinking", "thinking": "t", "signature": "sig"}, raw_use],
+                 "tool_calls": [{"id": "d1", "type": "function", "function": {
+                     "name": "tool_describe", "arguments": json.dumps({"names": ["session_search"]})}}]},
+                {"role": "tool", "tool_call_id": "d1", "content": '{"tools": {"session_search": {}}}'},
+            ],
+        )
+        blocks = [b for m in kwargs["messages"] for b in (m["content"] if isinstance(m["content"], list) else [])]
+        use = next(b for b in blocks if b.get("type") == "tool_use")
+        result = next(b for b in blocks if b.get("type") == "tool_result")
+        assert use["input"] == {"names": ["chat_history_lookup"]}
+        assert "chat_history_lookup" in json.dumps(result["content"])
+        assert "session_search" not in json.dumps(kwargs["messages"])
+
     def test_oauth_does_not_alias_longer_identifier_containing_token(self):
         """Word-boundary matching: a path like tools/session_search_tool.py
         must survive untouched, not become chat_history_lookup_tool.py."""

@@ -574,6 +574,30 @@ def _oauth_wire_namer(anthropic_tools: list[dict[str, Any]]):
     return to_wire
 
 
+def _alias_bridge_input_names(args: Any, to_wire) -> Any:
+    """Inverse of the transport's ``_unalias_bridge_input`` for replayed tool_call / tool_describe
+    inputs: normalize_response stored the reversed ``session_search``, which must not go back on the
+    wire (billing classifier) and is not the name the model sent. Prose-safe aliases only, matching
+    the catalog the model read; the collision rule comes from ``to_wire``."""
+    def fix(n: Any) -> Any:
+        if not isinstance(n, str) or n not in _OAUTH_PROSE_ALIAS_NAMES:
+            return n
+        return to_wire(n).removeprefix(_MCP_TOOL_PREFIX)
+
+    if not isinstance(args, dict):
+        return args
+    args = dict(args)
+    if isinstance(args.get("calls"), list):
+        args["calls"] = [{**c, "name": fix(c.get("name"))} if isinstance(c, dict) else c for c in args["calls"]]
+    if "name" in args:
+        args["name"] = fix(args["name"])
+    if isinstance(args.get("names"), list):
+        args["names"] = [fix(n) for n in args["names"]]
+    elif "names" in args:
+        args["names"] = fix(args["names"])
+    return args
+
+
 _OAUTH_SYSTEM_REPLACEMENTS = (
     ("Hermes Agent", "Claude Code"), ("Hermes agent", "Claude Code"), ("Nous Research", "Anthropic"),
 )
@@ -610,8 +634,12 @@ def _apply_claude_code_identity(system, anthropic_tools, anthropic_messages, to_
     for msg in anthropic_messages:
         for block in msg.get("content") if isinstance(msg.get("content"), list) else []:
             if isinstance(block, dict) and block.get("type") == "tool_use" and "name" in block:
-                if block["name"] in ("tool_describe", "tool_search"):
+                # A signed-thinking turn replays the raw response block, already ``mcp__``-prefixed.
+                bare = block["name"].removeprefix(_MCP_TOOL_PREFIX) if isinstance(block["name"], str) else None
+                if bare in ("tool_describe", "tool_search"):
                     catalog_reads.add(block.get("id"))
+                if bare in ("tool_call", "tool_describe"):
+                    block["input"] = _alias_bridge_input_names(block.get("input"), to_wire)
                 block["name"] = to_wire(block["name"])  # tool_result pairs by id, not name
             elif isinstance(block, dict) and block.get("type") == "tool_result" and block.get("tool_use_id") in catalog_reads:
                 content = block.get("content")  # tool_call results are tool output (data): left verbatim
