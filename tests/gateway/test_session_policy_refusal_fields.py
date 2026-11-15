@@ -85,6 +85,13 @@ def test_an_explicit_pick_of_a_configured_mcp_server_builds_before_it_connects(t
         assert repr(bad) in _refusal({'cwd': str(tmp_path), 'toolsets': ['terminal', bad]}, cfg).detail
 
 
+def test_the_oauth_wire_alias_of_session_search_selects_session_search(tmp_path):
+    """Anthropic OAuth shows ``session_search`` to the model as ``chat_history_lookup``, so an agent that
+    copies the documented ``hermes chat -t terminal,file,session_search,kanban`` sends the alias. It was
+    refused as an unknown toolset on 2026-11-15 (z-score review consult); it must select session_search."""
+    policy = build_policy({'source': 'cli', 'cwd': str(tmp_path), 'toolsets': ['terminal', 'chat_history_lookup']}, dict(_CFG))
+    assert 'session_search' in policy.toolsets and 'chat_history_lookup' not in policy.toolsets, policy.toolsets
+
 def test_a_rebound_launch_key_names_api_key():
     """``session.resume`` re-supplying a launch key refuses before it touches the authority."""
     with pytest.raises(RuntimeStoreError) as caught:

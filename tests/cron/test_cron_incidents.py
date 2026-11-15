@@ -192,6 +192,23 @@ def test_failure_type_classification(monkeypatch, tmp_path):
         assert inc._classify_failure_type(error) == expected, (error, expected)
 
 
+
+def test_agent_declared_failure_is_typed_declared_not_by_keywords(monkeypatch, tmp_path):
+    """2026-11-14 PM run (incident c6feaf_920ee62177ea): the run declared [CRON_FAILURE] and its prose
+    mentioned a "quota-decision card", so keyword typing filed it as rate_limit."""
+    _point_db(monkeypatch, tmp_path)
+    prose = "The run is still marked failed; I closed the silence-policy card and the quota-decision card."
+    assert incidents._classify_failure_type(prose) == "rate_limit"  # what keyword typing alone says
+    deliveries = []
+    with patch("cron.scheduler.run_job", return_value=(True, "out", f"[CRON_FAILURE]\n{prose}", None)), \
+         patch("cron.scheduler.save_job_output", return_value=str(tmp_path / "out.md")), \
+         patch("cron.scheduler.mark_job_run"), \
+         patch("cron.delivery_queue.enqueue", side_effect=lambda *a, **k: deliveries.append(a) or {"status": "pending"}):
+        sched.run_one_job(_job(id="declared-pm"))
+    rows = [r for r in incidents.list_incidents() if r["job_id"] == "declared-pm"]
+    assert [r["failure_type"] for r in rows] == ["agent_declared"]
+    assert deliveries  # the failure is still delivered
+
 # ── Lifecycle / ack ────────────────────────────────────────────────────────
 
 
