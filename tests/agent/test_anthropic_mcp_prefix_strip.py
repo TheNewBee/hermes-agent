@@ -15,6 +15,7 @@ tools, or the bare name for native tools) so the dispatcher is unaffected.
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -116,6 +117,25 @@ class TestAnthropicOAuthAliasRoundTrip:
 
         assert len(result.tool_calls) == 1
         assert result.tool_calls[0].name == "session_search"
+
+    def test_oauth_alias_nested_in_deferred_bridge_calls_is_reversed(self):
+        """The prose rewrite puts ``chat_history_lookup`` in the deferred catalog, so the model
+        passes it as a nested name to tool_call / tool_describe; it must dispatch as session_search."""
+        import json
+        transport = self._get_transport()
+        response = _make_response(
+            _make_tool_use_block("mcp__tool_call", "tc_1",
+                                 {"calls": [{"name": "chat_history_lookup", "arguments": {"query": "x"}}]}),
+            _make_tool_use_block("mcp__tool_describe", "tc_2", {"names": ["mcp__chat_history_lookup", "cronjob_manage"]}),
+        )
+        # Bridge tools are dispatched by model_tools, never registry entries: keep them OUT of the fake.
+        registry = _FakeRegistry({"session_search", "cronjob_manage"})
+        with patch("tools.registry.registry", registry):
+            result = transport.normalize_response(response, strip_tool_prefix=True)
+
+        assert [tc.name for tc in result.tool_calls] == ["tool_call", "tool_describe"]
+        assert json.loads(result.tool_calls[0].arguments)["calls"][0]["name"] == "session_search"
+        assert json.loads(result.tool_calls[1].arguments)["names"] == ["session_search", "cronjob_manage"]
 
     def test_oauth_memory_alias_round_trips_to_registry_name(self):
         transport = self._get_transport()
@@ -246,6 +266,49 @@ class TestAnthropicOAuthClassifierAlias:
         )
         assert "chat_history_lookup" in system_text
         assert "session_search" not in system_text
+
+    def test_oauth_aliases_session_search_in_catalog_read_results_only(self):
+        """tool_describe / tool_search results echo real schemas back onto the wire; alias them like
+        tool descriptions. A tool_call result is the tool's own output (data) and stays verbatim."""
+        tc = lambda i, n: {"id": i, "type": "function", "function": {"name": n, "arguments": "{}"}}
+        kwargs = self._build(
+            [self._tool("tool_describe"), self._tool("tool_call")],
+            messages=[
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "", "tool_calls": [tc("d1", "tool_describe"), tc("c1", "tool_call")]},
+                {"role": "tool", "tool_call_id": "d1", "content": '{"tools": {"session_search": {}}}'},
+                {"role": "tool", "tool_call_id": "c1", "content": "grep: session_search found"},
+            ],
+        )
+        results = {b["tool_use_id"]: json.dumps(b["content"]) for m in kwargs["messages"]
+                   for b in (m["content"] if isinstance(m["content"], list) else [])
+                   if b.get("type") == "tool_result"}
+        assert "chat_history_lookup" in results["d1"] and "session_search" not in results["d1"]
+        assert "session_search" in results["c1"]
+
+    def test_oauth_replayed_signed_thinking_bridge_turn_stays_aliased(self):
+        """Real route (t_3e75276d): a signed-thinking turn replays from the raw response blocks, so
+        the tool_use name is already ``mcp__tool_describe`` and its input carries the name the
+        transport reversed to ``session_search``. Neither the input nor the catalog-read result may
+        put the raw name back on the wire (billing classifier), and the model must see the alias it sent."""
+        raw_use = {"type": "tool_use", "id": "d1", "name": "mcp__tool_describe", "input": {"names": ["chat_history_lookup"]}}
+        kwargs = self._build(
+            [self._tool("tool_describe"), self._tool("tool_call")],
+            messages=[
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "", "anthropic_content_blocks": [
+                    {"type": "thinking", "thinking": "t", "signature": "sig"}, raw_use],
+                 "tool_calls": [{"id": "d1", "type": "function", "function": {
+                     "name": "tool_describe", "arguments": json.dumps({"names": ["session_search"]})}}]},
+                {"role": "tool", "tool_call_id": "d1", "content": '{"tools": {"session_search": {}}}'},
+            ],
+        )
+        blocks = [b for m in kwargs["messages"] for b in (m["content"] if isinstance(m["content"], list) else [])]
+        use = next(b for b in blocks if b.get("type") == "tool_use")
+        result = next(b for b in blocks if b.get("type") == "tool_result")
+        assert use["input"] == {"names": ["chat_history_lookup"]}
+        assert "chat_history_lookup" in json.dumps(result["content"])
+        assert "session_search" not in json.dumps(kwargs["messages"])
 
     def test_oauth_does_not_alias_longer_identifier_containing_token(self):
         """Word-boundary matching: a path like tools/session_search_tool.py
