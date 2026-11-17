@@ -23,8 +23,18 @@ def _pm_generation_dirs(prefixes) -> set[Path]:
     return found
 
 
-_INTERPRETER_PREFIXES = tuple({
+_RESOLVED_PREFIXES = {
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
+}
+_INTERPRETER_PREFIXES = tuple(_RESOLVED_PREFIXES | {
+    # Lexical spellings too: a uv venv's ``home`` names its base python via a minor-version alias
+    # (cpython-3.11-... -> cpython-3.11.15-...), so sys._base_executable sits under the alias and
+    # realpath()/islink() lstat it. Only spellings that resolve to a real prefix count, so a stray
+    # _base_executable can never widen the allowlist to an unrelated (home-level) directory.
+    Path(os.path.abspath(p)) for p in (
+        sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix,
+        os.path.dirname(os.path.dirname(getattr(sys, "_base_executable", "") or "")),
+    ) if p and Path(p).resolve() in _RESOLVED_PREFIXES
 } | {
     # A PM-activated developer shell runs sys.prefix's python against a dependency generation
     # whose site-packages sits under the (real) Hermes home; third-party imports from it are the

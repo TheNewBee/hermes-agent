@@ -260,3 +260,34 @@ def test_hermes_exported_scratch_tmp_is_not_the_test_temp_root(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 passed" in result.stdout
+
+
+def test_symlinked_base_python_of_the_venv_is_the_interpreter(tmp_path):
+    """uv names a venv's base python through a minor-version alias (``cpython-3.11-...`` ->
+    ``cpython-3.11.15-...``): sys.base_prefix is resolved but sys._base_executable keeps the alias,
+    and realpath()/islink() on it lstat the alias dir. Under a guarded root that is still the
+    interpreter's installation; siblings stay refused. Fresh interpreter: prefixes bind at import."""
+    runtime = tmp_path / "runtime"
+    real = runtime / "cpython-3.11.15"
+    (real / "bin").mkdir(parents=True)
+    (real / "bin" / "python3.11").write_text("", encoding="utf-8")
+    alias = runtime / "cpython-3.11"
+    alias.symlink_to(real.name)
+    script = textwrap.dedent(f"""
+        import sys
+        sys.base_prefix = sys.base_exec_prefix = {str(real)!r}
+        sys._base_executable = {str(alias / "bin" / "python3.11")!r}
+        from tests.home_io_guard import HomeIOGuard
+        guard = HomeIOGuard(lambda: [{str(runtime)!r}])
+        guard.check({str(alias)!r}, metadata=True)
+        guard.check(sys._base_executable, metadata=True)
+        try:
+            guard.check({str(runtime / "config.yaml")!r})
+        except AssertionError:
+            pass
+        else:
+            raise SystemExit("sibling of the interpreter was not refused")
+        """)
+    result = subprocess.run([sys.executable, "-c", script], cwd=PROJECT_ROOT,
+                            capture_output=True, text=True, timeout=60, check=False)
+    assert result.returncode == 0, result.stdout + result.stderr
