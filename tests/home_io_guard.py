@@ -23,6 +23,17 @@ def _pm_generation_dirs(prefixes) -> set[Path]:
     return found
 
 
+def _linked_worktree_git_dir(checkout: Path) -> set[Path]:
+    """A linked worktree's private admin dir (its ``.git`` is a ``gitdir:`` file naming the main
+    repo's ``.git/worktrees/<name>``). Import-time update recovery stats ``hermes-update-pull``
+    there: the checkout's own metadata, not Hermes state. The shared common dir stays guarded."""
+    try:
+        text = (checkout / ".git").read_text(encoding="utf-8")
+    except OSError:  # a main checkout's .git is a directory, already inside the checkout
+        return set()
+    return {(checkout / text.removeprefix("gitdir:").strip()).resolve()} if text.startswith("gitdir:") else set()
+
+
 _RESOLVED_PREFIXES = {
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
 }
@@ -52,6 +63,7 @@ _INTERPRETER_PREFIXES = tuple(_RESOLVED_PREFIXES | {
     # checkout's own .venv is not Hermes state; without this every run from a default install
     # trips on its first traceback.
     Path(__file__).resolve().parent.parent,
+    *_linked_worktree_git_dir(Path(__file__).resolve().parent.parent),
 })
 # The same prefixes as plain strings for the check() fast path. PurePath comparison folds case on
 # Windows; ``os.path.normcase`` (identity on POSIX) reproduces that for string compares. Prefixes

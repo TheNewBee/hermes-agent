@@ -291,3 +291,30 @@ def test_symlinked_base_python_of_the_venv_is_the_interpreter(tmp_path):
     result = subprocess.run([sys.executable, "-c", script], cwd=PROJECT_ROOT,
                             capture_output=True, text=True, timeout=60, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_linked_worktree_admin_dir_is_the_checkout(tmp_path):
+    """A linked worktree's ``.git`` is a ``gitdir:`` file naming its private admin dir in the main
+    repo's ``.git/worktrees/<name>``; import-time update recovery stats ``hermes-update-pull`` there.
+    That dir is the checkout's own metadata. A main checkout (``.git`` dir) adds nothing, and the
+    shared common dir around the admin dir stays refused."""
+    from tests.home_io_guard import HomeIOGuard, _linked_worktree_git_dir
+
+    common = tmp_path / "repo" / ".git"
+    admin = common / "worktrees" / "wt"
+    admin.mkdir(parents=True)
+    checkout = tmp_path / "wt"
+    checkout.mkdir()
+    (checkout / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8")
+    assert _linked_worktree_git_dir(checkout) == {admin.resolve()}
+    (checkout / ".git").write_text("gitdir: ../repo/.git/worktrees/wt\n", encoding="utf-8")
+    assert _linked_worktree_git_dir(checkout) == {admin.resolve()}
+    (tmp_path / "main" / ".git").mkdir(parents=True)
+    assert _linked_worktree_git_dir(tmp_path / "main") == set()
+
+    # When this run is itself a linked worktree, the guard allows its admin dir, not the common dir.
+    for own in _linked_worktree_git_dir(PROJECT_ROOT):
+        guard = HomeIOGuard(lambda: [own.parent.parent])
+        guard.check(own / "hermes-update-pull", metadata=True)
+        with pytest.raises(AssertionError, match="REAL hermes home"):
+            guard.check(own.parent.parent / "config")
