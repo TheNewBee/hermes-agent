@@ -272,7 +272,7 @@ def test_plain_429_reset_after_natural_fire_parks_on_lattice(tmp_cron_home, monk
     assert not qh.is_recovery_fire(held, held["next_run_at"])
 
 
-def test_scheduler_tick_parks_plain_429_using_job_primary_pool(tmp_cron_home):
+def test_scheduler_tick_parks_plain_429_using_job_primary_pool(tmp_cron_home, cron_owner):
     """Wiring: run_one_job feeds the run's primary pool + resolved model into the hold."""
     import time
 
@@ -289,7 +289,6 @@ def test_scheduler_tick_parks_plain_429_using_job_primary_pool(tmp_cron_home):
                  patch("cron.scheduler_delivery._resolve_origin", return_value=None), \
                  patch("hermes_cli.env_loader.load_hermes_dotenv"), \
                  patch("hermes_cli.env_loader.reset_secret_source_cache"), \
-                 patch("hermes_state_registry.acquire", return_value=MagicMock()), \
                  patch("tools.mcp_tool_discovery.discover_mcp_tools", return_value=[]), \
                  patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                        return_value=dict(runtime)), \
