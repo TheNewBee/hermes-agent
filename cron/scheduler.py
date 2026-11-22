@@ -628,6 +628,11 @@ _running_worker_pids: dict[tuple, int] = {}
 # skips exactly this set — see ``get_restart_wait_cron_counts``.
 _scope_isolated_job_ids: set = set()
 _running_lock = threading.Lock()
+# Terminal-artifact seam (cron_output_finalized). run_job records the session id; the
+# run_one_job wrapper clears and resets it per run so a stale id never leaks across ticks.
+# ponytail: model is not carried (validator accepts model=""); add when a consumer needs it.
+_cron_run_session_id: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "cron_run_session_id", default="")
 
 # Per in-flight id: time.time() claim instant + the future owning its release (``_FUTURE_PENDING``
 # until pool.submit returns). Past-allowance with no live future = leak; the sweep force-releases.
@@ -1379,6 +1384,18 @@ def drain_delivery_queue(adapters, loop) -> int:
         return error
 
     return drain(send)
+
+
+def _invoke_cron_output_finalized(*, response_text, session_id, model,
+                                  artifact_path, delivery_state) -> None:
+    """Notify observers only after cron has persisted its terminal artifact."""
+    try:
+        from hermes_cli.plugins import invoke_hook
+        invoke_hook("cron_output_finalized", response_text=response_text,
+                    session_id=session_id, model=model, platform="cron",
+                    artifact_path=artifact_path, delivery_state=delivery_state)
+    except Exception as exc:
+        logger.warning("cron_output_finalized hook failed: %s", exc)
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
@@ -2532,6 +2549,7 @@ def run_job(
 
     _cron_session_id = (owner_execution[1] if owner_execution is not None else
                         f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}")
+    _cron_run_session_id.set(_cron_session_id)
     agent = None
     model = ""
     _session_db = None
@@ -2824,6 +2842,7 @@ def run_one_job(
     with _running_lock:
         _running_fire_owners.setdefault(_fire_key, {})[execution_token] = (
             fire_owner or None, profile_home)
+    session_token = _cron_run_session_id.set("")
     try:
         with self_removal_delivery_scope(job["id"]):
             return _run_with_fire_claim_heartbeat(
@@ -2838,6 +2857,7 @@ def run_one_job(
                     transport_cancel=cancel_event,
                     execution_token=execution_token))
     finally:
+        _cron_run_session_id.reset(session_token)
         with _running_lock:
             executions = _running_fire_owners.get(_fire_key)
             if executions is not None:
@@ -3002,6 +3022,7 @@ class _RunDelivery:
     incident_acked: bool = False
     failure_incident_id: Optional[str] = None
     side_effect_ownership_lost: bool = False
+    output_file: Optional[Any] = None
 
 
 def _save_compose_deliver(
@@ -3018,6 +3039,7 @@ def _save_compose_deliver(
         output_file = (
             None if self_removal_delivery_allowed(job["id"])
             else save_job_output(job["id"], output))
+    d.output_file = output_file
     if verbose and output_file is not None:
         logger.info("Output saved to: %s", output_file)
 
@@ -3357,6 +3379,15 @@ def _run_one_job_body(
             finish_interrupted_run(job, execution_id, delivery_error)
             return True
 
+        session_id = _cron_run_session_id.get()
+        if d.success and session_id and not d.side_effect_ownership_lost:
+            if d.should_deliver:
+                delivery_state = "DELIVERY_FAILED" if d.delivery_error else "DELIVERY_ATTEMPTED"
+            else:
+                delivery_state = "PERSISTED_ONLY"
+            _invoke_cron_output_finalized(
+                response_text=final_response, session_id=session_id, model="",
+                artifact_path=str(d.output_file or ""), delivery_state=delivery_state)
         from cron.scheduler_bookkeeping import finish_completed_run
         return finish_completed_run(d, fire_owner, execution_id)
 
