@@ -192,6 +192,16 @@ def test_failure_type_classification(monkeypatch, tmp_path):
         assert inc._classify_failure_type(error) == expected, (error, expected)
 
 
+def test_failure_type_ignores_rate_words_beyond_persisted_window(monkeypatch, tmp_path):
+    inc = _point_db(monkeypatch, tmp_path)
+    long_prose = (
+        "Lane timed out without writing code. " + "filler report line " * 60
+        + " quota exceeded, HTTP 429, rate limit mentioned in old notes"
+    )
+    assert inc._classify_failure_type(long_prose) == "timeout"
+    assert inc._classify_failure_type("HTTP 429 at the start: rate limit") == "rate_limit"
+
+
 # ── Lifecycle / ack ────────────────────────────────────────────────────────
 
 

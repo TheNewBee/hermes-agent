@@ -139,8 +139,13 @@ def _incident_id(job_id: str, error_sig: str) -> str:
 
 
 def _classify_failure_type(error: str) -> str:
-    """Classify a failure from error-text keywords; ``unknown`` is the default."""
-    text = _normalize_error(error)
+    """Classify a failure from error-text keywords; ``unknown`` is the default.
+
+    Only the persisted window (``MAX_ERROR_CHARS``) is scanned. Run output can be long report
+    prose; incidental words such as "quota" or "429" deep in it used to outrank the real cause
+    (a timeout labelled ``rate_limit``, 2026-11-22 c6feafaa0d3c).
+    """
+    text = _normalize_error(error)[:MAX_ERROR_CHARS]
     if not text:
         return "unknown"
     for kind, patterns in _FAILURE_TYPE_ORDER:
