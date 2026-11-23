@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
+import run_agent  # noqa: F401  # collection-time: hermes_bootstrap's marker check must precede the real-home guard
 from cron import incidents
 import cron.jobs as cron_jobs
 import cron.scheduler as sched
