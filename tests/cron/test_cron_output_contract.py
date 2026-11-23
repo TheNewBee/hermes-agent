@@ -107,6 +107,31 @@ def test_not_required_or_silent_or_empty_skips(tmp_path):
     assert record["status"] == "SKIP"
 
 
+PM_DRAFT = (FIXTURES / "pm_review_e8b27_2026-11-22_12-00.draft.md").read_text(encoding="utf-8")
+PM_RESTATED = (FIXTURES / "pm_review_e8b27_2026-11-22_12-00.restated.md").read_text(encoding="utf-8")
+PM_CONSULT = ("Opus consult: local-bb6cc7debaf8321a96eb189bcfa09b21c21002e5e8388e4ed3bdb70f55261488 - the "
+              "activation consult decided publishing is the PM's job, but switching the live code and "
+              "restarting the gateway need your approval.")
+
+
+def test_restatement_that_drops_the_consult_line_gets_it_back_on_top(tmp_path):
+    # Real 2026-11-22 12:00 run of e8b27c96c349 (t_702c9a6e): the draft carried the consult line,
+    # the label restatement dropped it and still asked "until you approve the switch".
+    assert PM_CONSULT in PM_DRAFT and "Opus consult:" not in PM_RESTATED
+    delivered, record = _run(tmp_path, PM_DRAFT, _Turns(PM_RESTATED))
+    assert delivered == PM_CONSULT + "\n\n" + PM_RESTATED
+    assert delivered.index("Opus consult:") < delivered.index("you approve")
+    assert record["delivered"] == "repair" and record["consult_lines_carried"] == 1
+    assert missing_labels(delivered) == []
+
+
+def test_restatement_that_keeps_the_consult_line_is_unchanged(tmp_path):
+    kept = PM_CONSULT + "\n\n" + PM_RESTATED
+    delivered, record = _run(tmp_path, PM_DRAFT, _Turns(kept))
+    assert delivered == kept and record["consult_lines_carried"] == 0
+    assert "Opus consult:" in REPAIR_PROMPT
+
+
 def test_verdict_write_failure_never_changes_delivery(tmp_path):
     bad = tmp_path / "file"
     bad.write_text("x")

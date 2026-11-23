@@ -36,8 +36,19 @@ REPAIR_PROMPT = (
     + ", ".join(LABELS) + ". Do not call any tools and do not do new work. Restate your complete "
     "final report for this run, keeping everything the job instructions require (verdict line, "
     "numbered sections, continuation ledger, ticket IDs), and make sure each of the six labels "
-    "appears as its own labelled line, e.g. '- Done: ...'. Use 'None.' for an empty label."
+    "appears as its own labelled line, e.g. '- Done: ...'. Use 'None.' for an empty label. "
+    "Keep every 'Opus consult:' line verbatim, before any question or approval request."
 )
+# Same shape as the Opus-first line in scripts/pm_morning_response_validator.py (shape only; the
+# reference is not resolved here).
+_CONSULT_LINE = re.compile(r"^[ \t]*(?:[-*][ \t]+)?Opus consult: \S+ - \S.*$", re.MULTILINE)
+
+
+def carry_consult_lines(original: str, repaired: str) -> tuple[str, int]:
+    """Put back, on top, any 'Opus consult:' line the restatement dropped, so it precedes any ask."""
+    lost = [line for line in dict.fromkeys(m.group(0).strip() for m in _CONSULT_LINE.finditer(original))
+            if line not in repaired]
+    return (("\n".join(lost) + "\n\n" + repaired) if lost else repaired), len(lost)
 
 
 def missing_labels(text: str) -> list[str]:
@@ -91,7 +102,8 @@ def finalize_with_contract(
         repaired = ""
         record["repair_error"] = f"{type(exc).__name__}: {exc}"[:300]
     if repaired.strip() and not missing_labels(repaired):
-        record.update(status="PASS", missing=[], delivered="repair")
+        repaired, carried = carry_consult_lines(response, repaired)
+        record.update(status="PASS", missing=[], delivered="repair", consult_lines_carried=carried)
         _write(verdict_path, record)
         return repaired
     # ponytail: if the repair turn ran, the continuation-ledger plugin's pending record now
