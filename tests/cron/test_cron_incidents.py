@@ -208,6 +208,15 @@ def test_agent_declared_failure_is_typed_declared_not_by_keywords(monkeypatch, t
     rows = [r for r in incidents.list_incidents() if r["job_id"] == "declared-pm"]
     assert [r["failure_type"] for r in rows] == ["agent_declared"]
     assert deliveries  # the failure is still delivered
+def test_failure_type_ignores_rate_words_beyond_persisted_window(monkeypatch, tmp_path):
+    inc = _point_db(monkeypatch, tmp_path)
+    long_prose = (
+        "Lane timed out without writing code. " + "filler report line " * 60
+        + " quota exceeded, HTTP 429, rate limit mentioned in old notes"
+    )
+    assert inc._classify_failure_type(long_prose) == "timeout"
+    assert inc._classify_failure_type("HTTP 429 at the start: rate limit") == "rate_limit"
+
 
 # ── Lifecycle / ack ────────────────────────────────────────────────────────
 
